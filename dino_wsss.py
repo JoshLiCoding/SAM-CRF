@@ -10,16 +10,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import yaml
 import wandb
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+from ultralytics import FastSAM
+import ultralytics
 
 from model.dino import DinoWSSS
 from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
 from model.scheduler import PolyLR
-from model.dino_txt_full_img import generate_pseudolabels
+from model.dino_txt_full_img import generate_pseudolabels_batch
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
 from utils.loss import CollisionCrossEntropyLoss, PottsLoss
 from utils.metrics import update_miou
-from vis import vis_train_sample_img, vis_val_sample_img, vis_train_loss, vis_val_loss
+from utils.sam import generate_sam_contours_batch
+from utils.vis import vis_train_sample_img, vis_val_sample_img, vis_train_loss, vis_val_loss
+import sys
+DINOV3_LOCATION = '/u501/j234li/wsss/model/dinov3'
+sys.path.append(DINOV3_LOCATION)
 
 def load_config(config_path='config.yaml'):
     """Load configuration from YAML file"""
@@ -68,41 +73,12 @@ DIRS = {
     'checkpoints': config['directories']['checkpoints'],
     'visualizations': config['directories']['visualizations'].format(num_epochs=NUM_EPOCHS)
 }
-
-# Create directories
 for dir_name, dir_path in DIRS.items():
     full_path = os.path.join(DIRS['output'], dir_path) if dir_name != 'output' else dir_path
     os.makedirs(full_path, exist_ok=True)
-
 PATHS = {
-    'model_checkpoint': config['paths']['model_checkpoint'],
-    'model': config['paths']['model'].format(num_epochs=NUM_EPOCHS),
-    'sam_checkpoint': config['sam']['checkpoint_path']
+    'model': config['paths']['model'].format(num_epochs=NUM_EPOCHS)
 }
-
-def generate_sam_contours(voc_train_dataset, start_index=0):
-    sam_checkpoint = PATHS['sam_checkpoint']
-    model_type = config['sam']['model_type']
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(device)
-    mask_generator = SamAutomaticMaskGenerator(model=sam)
-    for i, (image, target) in tqdm(enumerate(voc_train_dataset), desc="Generating SAM contours"):
-        if i < start_index:
-            continue
-        image = np.array(image)
-        masks = mask_generator.generate(image)
-        H, W = image.shape[:2]
-        contours_x = np.zeros((H, W - 1), dtype=bool)
-        contours_y = np.zeros((H - 1, W), dtype=bool)
-
-        for mask in masks:
-            segmentation = mask['segmentation']
-            contours_x |= np.logical_xor(segmentation[:, :-1], segmentation[:, 1:]) # shape: (H, W-1)
-            contours_y |= np.logical_xor(segmentation[:-1, :], segmentation[1:, :]) # shape: (H-1, W)
-
-        np.save(os.path.join(config['directories']['sam_cache'], f'sam_contours_x_{i}.npy'), contours_x)
-        np.save(os.path.join(config['directories']['sam_cache'], f'sam_contours_y_{i}.npy'), contours_y)
-
-    print("All SAM contours generated.")
 
 def main():
     # Print configuration parameters
@@ -145,16 +121,9 @@ def main():
             image_set=config['dataset']['val_image_set'],
             download=config['dataset']['download']
         )
-    
-    # generate_sam_contours(original_train_dataset)
-    generate_pseudolabels(original_train_dataset, config['dataset']['dataset_name'])
-    # 9500, 19000
-    return
 
     train_dataset = CustomSegmentationTrain(
-        original_train_dataset, NUM_CLASSES, 
-        config['directories']['sam_cache'],
-        config['directories']['pseudolabels']
+        original_train_dataset
     )
     train_loader = DataLoader(
         train_dataset,
@@ -162,6 +131,21 @@ def main():
         shuffle=True,
     )
     val_dataset = CustomSegmentationVal(original_val_dataset)
+    
+    # Initialize FastSAM model for batch processing
+    fastsam_model = FastSAM('FastSAM-x.pt')
+    
+    # Initialize DinoTxt model and tokenizer for pseudolabel generation
+    text_model, tokenizer = torch.hub.load(
+        DINOV3_LOCATION,
+        'dinov3_vitl16_dinotxt_tet1280d20h24l', 
+        source='local',
+        weights=os.path.join(DINOV3_LOCATION, 'weights', 'dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth'), 
+        backbone_weights=os.path.join(DINOV3_LOCATION, 'weights', 'dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth')
+    )
+    text_model = text_model.to(device)
+    text_model.eval()
+    
     model = DinoWSSS(
         backbone_name=config['model']['backbone_name'],
         num_transformer_blocks=config['model']['num_transformer_blocks'],
@@ -169,10 +153,13 @@ def main():
         out_channels=config['model']['out_channels'],
         use_bottleneck=config['model']['use_bottleneck']
     ).to(device)
+    model.backbone.eval()
+    model.dinotxt_head.eval()
     optimizer = torch.optim.SGD(params=[
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
         {'params': model.conv_blocks.parameters(), 'lr': LEARNING_RATE},
-        {'params': model.conv_final.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.lin_classifier.parameters(), 'lr': LEARNING_RATE},
     ], lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     # scheduler = PolyLR(optimizer, NUM_EPOCHS * len(train_loader), power=0.9)
 
@@ -183,9 +170,10 @@ def main():
     # ], lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     # scheduler = PolyLR(optimizer, NUM_EPOCHS * len(train_loader), power=0.9)
 
-    if os.path.exists(PATHS['model_checkpoint']):
-        print(f"Loading checkpoint from {PATHS['model_checkpoint']}...")
-        checkpoint = torch.load(PATHS['model_checkpoint'], map_location=device, weights_only=False)
+    model_checkpoint = config['paths']['model_checkpoint']
+    if os.path.exists(model_checkpoint):
+        print(f"Loading checkpoint from {model_checkpoint}...")
+        checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Resuming training")
     else:
@@ -206,21 +194,70 @@ def main():
         running_total_loss = 0.0
         running_unary_loss = 0.0
         running_pairwise_loss = 0.0
-        for i, (transformed_images, targets, pseudolabel_probs, sam_contours_x_batch, sam_contours_y_batch) in enumerate(train_loader):
+        for i, (transformed_images, targets) in tqdm(enumerate(train_loader), total=len(train_loader), desc="Training batches"):
             transformed_images = transformed_images.to(device)
-            targets = targets.to(device)
-            pseudolabel_probs = pseudolabel_probs.to(device)
+
+            optimizer.zero_grad()
+            
+            # Forward pass through model to get segmentation and dino.txt patch tokens
+            model_outputs = model(transformed_images)
+            segmentations = model_outputs['seg']
+            dinotxt_patch_tokens = model_outputs['dinotxt']  # [B, P, D]
+            
+            # Generate pseudolabels from dino.txt patch tokens (batch processing)
+            with torch.no_grad():
+                pseudolabels_batch, class_indices_batch = generate_pseudolabels_batch(
+                    dinotxt_patch_tokens, targets, config, text_model, tokenizer
+                )
+            
+            # Convert pseudolabels to tensor format matching segmentation output
+            # segmentations shape: [B, C, H, W] where C=21 for VOC
+            B, _, H_seg, W_seg = segmentations.shape
+            pseudolabel_probs = torch.zeros((B, NUM_CLASSES, H_seg, W_seg), dtype=torch.float32, device=device)
+            
+            for b in range(B):
+                pseudolabel = pseudolabels_batch[b]  # [num_fg + 1, p, p] or [1, p, p] if no fg classes (C, H, W format)
+                class_indices = class_indices_batch[b]
+                
+                # pseudolabel is already in [C, H, W] format, just add batch dimension
+                pseudolabel_tensor = torch.from_numpy(pseudolabel).float()  # [num_fg+1, p, p] or [1, p, p] (C, H, W)
+                pseudolabel_tensor = pseudolabel_tensor.unsqueeze(0)  # [1, num_fg+1, p, p] or [1, 1, p, p] (N, C, H, W)
+                
+                # Interpolate to segmentation size
+                pseudolabel_tensor = F.interpolate(pseudolabel_tensor, size=(H_seg, W_seg), mode='bilinear', align_corners=False)
+                pseudolabel_tensor = pseudolabel_tensor[0]  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg] (C, H, W)
+                
+                # Softmax with temperature
+                t = 0.03
+                pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
+                
+                # Map to full class space [NUM_CLASSES, H_seg, W_seg]
+                if len(class_indices) == 0:
+                    # Only background class
+                    pseudolabel_probs[b, 0] = pseudolabel_probs_b[0]  # background
+                else:
+                    for idx, class_idx in enumerate(class_indices):
+                        pseudolabel_probs[b, class_idx] = pseudolabel_probs_b[idx]
+                    pseudolabel_probs[b, 0] = pseudolabel_probs_b[len(class_indices)]  # background
+            
+            images_pil = []
+            for img in transformed_images:
+                img_denorm = train_dataset.denormalize(img.clone())
+                img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
+                img_np = (img_np * 255).astype(np.uint8)
+                images_pil.append(Image.fromarray(img_np))
+            
+            sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
+                fastsam_model, images_pil, device
+            )
             sam_contours_x_batch = sam_contours_x_batch.to(device)
             sam_contours_y_batch = sam_contours_y_batch.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(transformed_images)
-
             # unary potential
-            unary_loss = CollisionCrossEntropyLoss(outputs, pseudolabel_probs) # torch.nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)(outputs, targets)
+            unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
 
             # pairwise potential
-            pairwise_loss = torch.tensor(0.0, device=device) # PottsLoss(POTTS_TYPE, outputs, sam_contours_x_batch, sam_contours_y_batch, DISTANCE_TRANSFORM) # torch.tensor(0.0, device=device)
+            pairwise_loss = PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, DISTANCE_TRANSFORM)
 
             total_loss = unary_loss + pairwise_loss
 
@@ -280,8 +317,9 @@ def main():
                     val_transformed_image = val_transformed_image.to(device)
                     val_target = val_target.to(device)
 
-                    val_outputs = model(val_transformed_image.unsqueeze(0))
-                    update_miou(val_outputs, val_target.unsqueeze(0), intersection_counts, union_counts, NUM_CLASSES, IGNORE_INDEX)
+                    val_output = model(val_transformed_image.unsqueeze(0))
+                    segmentation = val_output['seg']
+                    update_miou(segmentation, val_target.unsqueeze(0), intersection_counts, union_counts, NUM_CLASSES, IGNORE_INDEX)
 
             ious = []
             for cls in range(NUM_CLASSES):
@@ -332,7 +370,11 @@ def main():
     
     vis_output_dir = os.path.join(DIRS['output'], DIRS['visualizations'])
     for i in range(0, len(original_train_dataset), config['visualization']['train_sample_interval']):
-        vis_train_sample_img(original_train_dataset, train_dataset, model, i, DISTANCE_TRANSFORM, vis_output_dir)
+        vis_train_sample_img(
+            original_train_dataset, train_dataset, model, i, DISTANCE_TRANSFORM, vis_output_dir,
+            text_model=text_model, tokenizer=tokenizer, config=config, 
+            fastsam_model=fastsam_model, num_classes=NUM_CLASSES
+        )
     vis_train_loss(NUM_EPOCHS, epoch_total_losses, epoch_unary_losses, epoch_pairwise_losses, vis_output_dir)
     
     if not TRAIN_ONLY:

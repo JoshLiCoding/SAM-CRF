@@ -35,23 +35,16 @@ dataset:
   val_image_set: 'val'
   download: false
 
-# SAM Parameters
-sam:
-  checkpoint_path: 'sam_checkpoint/sam_vit_h_4b8939.pth'
-  model_type: "vit_h"
-
 # Directory Structure
 directories:
-  output: 'output_4'
+  output: 'output_5'
   checkpoints: 'checkpoints'
-  sam_cache: 'sam_cache'
-  pseudolabels: 'pseudolabels_3'
-  visualizations: 'vis_{num_epochs}epochs_t=0.03'
+  visualizations: 'vis_{num_epochs}epochs_t=0.03_w=1000'
 
 # File Paths
 paths:
-  model_checkpoint: 'output_4/checkpoints/none.pt'
-  model: 'output_4/checkpoints/{num_epochs}epochs_t=0.03.pt'
+  model_checkpoint: 'output_5/checkpoints/none.pt'
+  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_w=1000.pt'
 
 # Visualization Parameters
 visualization:

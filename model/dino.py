@@ -15,6 +15,7 @@ sys.path.append(DINOV3_LOCATION)
 from dinov3.layers import SelfAttentionBlock, SwiGLUFFN
 from dinov3.models.vision_transformer import init_weights_vit
 from dinov3.utils import named_apply
+from dinov3.eval.text.vision_tower import VisionHead
 from model.resnet import Bottleneck
 
 
@@ -34,7 +35,8 @@ class DinoWSSS(nn.Module):
         self.num_conv_blocks = num_conv_blocks
         self.use_bottleneck = use_bottleneck
 
-        self.backbone = self._load_pretrained_backbone(backbone_name)
+        # Load backbone and dino.txt head together so backbone is only loaded once
+        self.backbone, self.dinotxt_head = self._load_pretrained_backbone_and_dinotxt_head(backbone_name)
         self.backbone_dim = self.backbone.embed_dim
         self.num_heads = self.backbone.num_heads
         self.patch_token_layer = 1
@@ -59,8 +61,6 @@ class DinoWSSS(nn.Module):
         self.ln = nn.LayerNorm(self.backbone_dim)
 
         if use_bottleneck:
-            # Use bottleneck blocks from resnet.py
-            # Bottleneck expansion is 4, so planes = backbone_dim // 4 to get output of backbone_dim
             planes = self.backbone_dim // Bottleneck.expansion
             conv_list = [
                 Bottleneck(
@@ -88,22 +88,33 @@ class DinoWSSS(nn.Module):
                 for _ in range(num_conv_blocks)
             ]
         self.conv_blocks = nn.ModuleList(conv_list)
-        self.conv_final = nn.Conv2d(self.backbone_dim, out_channels, kernel_size=1, padding=0, bias=True)
+        self.lin_classifier = nn.Conv2d(self.backbone_dim, out_channels, kernel_size=1, padding=0, bias=True)
 
         self.init_weights()
 
-    def _load_pretrained_backbone(self, backbone_name: str):
-        """Load pretrained DINOv3 backbone"""
+    def _load_pretrained_backbone_and_dinotxt_head(self, backbone_name: str):
         if backbone_name != "dinov3_vitl16":
             raise NotImplementedError(f"Backbone {backbone_name} not implemented")
-        
-        backbone = torch.hub.load(
+        # Load dinotxt composite (visual backbone + head) once from local hub
+        dinotxt_model, _ = torch.hub.load(
             DINOV3_LOCATION,
-            backbone_name,
-            source="local",
-            weights=os.path.join(DINOV3_LOCATION, 'weights', 'dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth')
+            'dinov3_vitl16_dinotxt_tet1280d20h24l',
+            source='local',
+            weights=os.path.join(
+                DINOV3_LOCATION,
+                'weights',
+                'dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth',
+            ),
+            backbone_weights=os.path.join(
+                DINOV3_LOCATION,
+                'weights',
+                'dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth',
+            ),
         )
-        return backbone
+        # Extract backbone and head; both are already initialized with pretrained weights
+        backbone = dinotxt_model.visual_model.backbone
+        dinotxt_head = dinotxt_model.visual_model.head
+        return backbone, dinotxt_head
 
     def init_weights(self):
         """Initialize weights for segmentation blocks"""
@@ -120,8 +131,8 @@ class DinoWSSS(nn.Module):
                         nn.init.constant_(m.weight, 1)
                         nn.init.constant_(m.bias, 0)
         
-        nn.init.kaiming_normal_(self.conv_final.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.constant_(self.conv_final.bias, 0)
+        nn.init.kaiming_normal_(self.lin_classifier.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.constant_(self.lin_classifier.bias, 0)
     
     def get_backbone_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = self.backbone.get_intermediate_layers(
@@ -135,26 +146,34 @@ class DinoWSSS(nn.Module):
         register_tokens = tokens[0][2]
         return class_token, patch_tokens, register_tokens
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through backbone and segmentation blocks"""
-        # Extract features from pretrained backbone
+    def forward(self, x: torch.Tensor) -> dict:
+        """
+        Forward pass through backbone, segmentation blocks and dino.txt vision head.
+        
+        Returns:
+            dict with keys:
+                - 'segmentation': segmentation output (same as before)
+                - 'dinotxt_patch_tokens': patch tokens from dino.txt head for pseudolabel generation
+        """
+        # Extract features from pretrained backbone (only once)
         with torch.no_grad():
             class_token, patch_tokens, register_tokens = self.get_backbone_features(x)
         
+        # Process for segmentation
         tokens = torch.cat([class_token.unsqueeze(1), register_tokens, patch_tokens], dim=1)
         for block in self.transformer_blocks:
             tokens = block(tokens)
         tokens = self.ln(tokens)
         
         # Extract patch tokens for spatial processing
-        patch_tokens = tokens[:, self.num_register_tokens + 1:] # (B, P, D)
+        seg_patch_tokens = tokens[:, self.num_register_tokens + 1:] # (B, P, D)
         
         # Get patch grid dimensions from patch tokens
-        p = int(math.sqrt(patch_tokens.size(1)))
-        assert p * p == patch_tokens.size(1), "non-square patch grid"
+        p = int(math.sqrt(seg_patch_tokens.size(1)))
+        assert p * p == seg_patch_tokens.size(1), "non-square patch grid"
         
         # Reshape patch tokens to spatial format [B, embed_dim, H, W]
-        patch_tokens_spatial = patch_tokens.permute(0, 2, 1).view(patch_tokens.size(0), patch_tokens.size(2), p, p)
+        patch_tokens_spatial = seg_patch_tokens.permute(0, 2, 1).view(seg_patch_tokens.size(0), seg_patch_tokens.size(2), p, p)
 
         # Upsample patch tokens to original image size (4x downsampled)
         H, W = x.shape[2:]
@@ -172,9 +191,19 @@ class DinoWSSS(nn.Module):
                 patch_tokens_spatial = patch_tokens_spatial + identity
                 patch_tokens_spatial = F.relu(patch_tokens_spatial)
         
-        # Final classification layer
-        output = self.conv_final(patch_tokens_spatial)
-        output = F.interpolate(output, size=(H, W), mode='bilinear', align_corners=False)
+        out = {}
+        segmentation = self.lin_classifier(patch_tokens_spatial)
+        out['seg'] = segmentation
         
-        return output
+        # Process for dino.txt pseudolabel generation (using same backbone features)
+        # Process tokens through dino.txt head
+        dinotxt_tokens = torch.cat([class_token.unsqueeze(1), register_tokens, patch_tokens], dim=1)
+        # Explicitly disable gradients for dino.txt path
+        with torch.no_grad():
+            dinotxt_output = self.dinotxt_head(dinotxt_tokens)
+        # Extract patch tokens from dino.txt head output
+        dinotxt_patch_tokens = dinotxt_output[:, self.num_register_tokens + 1:]  # (B, P, embed_dim)
+        out['dinotxt'] = dinotxt_patch_tokens
+        
+        return out
 

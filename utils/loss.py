@@ -8,11 +8,11 @@ def calculate_pairwise_affinity(sam_contour, transform_type):
     device = sam_contour.device
 
     # dilate by 15
-    sam_contour_cpu = sam_contour.cpu().numpy()
-    dilated_contour = np.zeros_like(sam_contour_cpu)
-    for i in range(sam_contour_cpu.shape[0]):
-        dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=17)
-    sam_contour = torch.from_numpy(dilated_contour).to(device)
+    # sam_contour_cpu = sam_contour.cpu().numpy()
+    # dilated_contour = np.zeros_like(sam_contour_cpu)
+    # for i in range(sam_contour_cpu.shape[0]):
+    #     dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=17)
+    # sam_contour = torch.from_numpy(dilated_contour).to(device)
 
     if transform_type is None:
         w = (~sam_contour.bool()).to(torch.float32)
@@ -73,7 +73,7 @@ def PottsLoss(type, logits, sam_contours_x, sam_contours_y, distance_transform):
         num_classes = prob.shape[1]
         
         device = prob.device
-        class_weights = torch.full((num_classes,), 20000.0, device=device, dtype=prob.dtype)
+        class_weights = torch.full((num_classes,), 1000.0, device=device, dtype=prob.dtype)
 
         # List A:
         # class_weights[5] = 500.0    # bottle
