@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 def calculate_pairwise_affinity(sam_contour, transform_type):
     device = sam_contour.device
 
-    # dilate by 15
-    # sam_contour_cpu = sam_contour.cpu().numpy()
-    # dilated_contour = np.zeros_like(sam_contour_cpu)
-    # for i in range(sam_contour_cpu.shape[0]):
-    #     dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=17)
-    # sam_contour = torch.from_numpy(dilated_contour).to(device)
+    # dilate by 4
+    sam_contour_cpu = sam_contour.cpu().numpy()
+    dilated_contour = np.zeros_like(sam_contour_cpu)
+    for i in range(sam_contour_cpu.shape[0]):
+        dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=4)
+    sam_contour = torch.from_numpy(dilated_contour).to(device)
 
     if transform_type is None:
         w = (~sam_contour.bool()).to(torch.float32)
@@ -25,9 +25,6 @@ def calculate_pairwise_affinity(sam_contour, transform_type):
             elif transform_type == 'exponential':
                 # T = 20
                 w[i] = np.exp(ndimage.distance_transform_edt(~sam_contour_cpu[i].astype(bool)) / 20.0) * 20.0
-            elif transform_type == 'gaussian_blur':
-                blur = ndimage.gaussian_filter(sam_contour_cpu[i], sigma=5)
-                w[i] = 1-blur
             
         w = torch.from_numpy(w).to(dtype=torch.float32, device=device)
     return w
@@ -73,7 +70,7 @@ def PottsLoss(type, logits, sam_contours_x, sam_contours_y, distance_transform):
         num_classes = prob.shape[1]
         
         device = prob.device
-        class_weights = torch.full((num_classes,), 1000.0, device=device, dtype=prob.dtype)
+        class_weights = torch.full((num_classes,), 200.0, device=device, dtype=prob.dtype)
 
         # List A:
         # class_weights[5] = 500.0    # bottle

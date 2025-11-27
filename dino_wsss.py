@@ -16,7 +16,7 @@ import ultralytics
 from model.dino import DinoWSSS
 from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
 from model.scheduler import PolyLR
-from model.dino_txt_full_img import generate_pseudolabels_batch
+from model.dino_txt_full_img import generate_pseudolabels_batch, build_text_embeddings, get_class_names_from_config
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
 from utils.loss import CollisionCrossEntropyLoss, PottsLoss
 from utils.metrics import update_miou
@@ -146,21 +146,38 @@ def main():
     text_model = text_model.to(device)
     text_model.eval()
     
+    # Precompute text embeddings for all classes (once before training)
+    print("Precomputing text embeddings for all classes...")
+    all_fg_class_names, background_class_names, num_all_fg, num_bg = get_class_names_from_config(config)
+    all_class_names = all_fg_class_names + background_class_names
+    text_emb_all = build_text_embeddings(text_model, tokenizer, all_class_names, device=device)  # [num_all_classes, D]
+    print(f"Text embeddings computed: shape {text_emb_all.shape}")
+    
     model = DinoWSSS(
         backbone_name=config['model']['backbone_name'],
         num_transformer_blocks=config['model']['num_transformer_blocks'],
         num_conv_blocks=config['model']['num_conv_blocks'],
         out_channels=config['model']['out_channels'],
-        use_bottleneck=config['model']['use_bottleneck']
+        use_bottleneck=config['model']['use_bottleneck'],
+        use_transpose_conv=config['model']['use_transpose_conv']
     ).to(device)
     model.backbone.eval()
     model.dinotxt_head.eval()
-    optimizer = torch.optim.SGD(params=[
+    
+    optimizer_params = [
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
         {'params': model.conv_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.lin_classifier.parameters(), 'lr': LEARNING_RATE},
-    ], lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    ]
+    if config['model']['use_transpose_conv']:
+        optimizer_params.append({'params': model.upsample_conv1.parameters(), 'lr': LEARNING_RATE})
+        optimizer_params.append({'params': model.upsample_conv2.parameters(), 'lr': LEARNING_RATE})
+    
+    optimizer = torch.optim.SGD(
+        params=optimizer_params,
+        lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
+    )
     # scheduler = PolyLR(optimizer, NUM_EPOCHS * len(train_loader), power=0.9)
 
     # model = deeplabv3_resnet101(NUM_CLASSES).to(device)
@@ -194,7 +211,7 @@ def main():
         running_total_loss = 0.0
         running_unary_loss = 0.0
         running_pairwise_loss = 0.0
-        for i, (transformed_images, targets) in tqdm(enumerate(train_loader), total=len(train_loader), desc="Training batches"):
+        for i, (transformed_images, targets) in enumerate(train_loader):
             transformed_images = transformed_images.to(device)
 
             optimizer.zero_grad()
@@ -207,7 +224,7 @@ def main():
             # Generate pseudolabels from dino.txt patch tokens (batch processing)
             with torch.no_grad():
                 pseudolabels_batch, class_indices_batch = generate_pseudolabels_batch(
-                    dinotxt_patch_tokens, targets, config, text_model, tokenizer
+                    dinotxt_patch_tokens, targets, text_emb_all, num_all_fg, num_bg
                 )
             
             # Convert pseudolabels to tensor format matching segmentation output
@@ -230,6 +247,22 @@ def main():
                 # Softmax with temperature
                 t = 0.03
                 pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
+                
+                # # Apply per-channel min-max normalization
+                # # pseudolabel_probs_b shape: [C, H, W]
+                # min_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0]  # [C, 1]
+                # max_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0]  # [C, 1]
+                # min_per_channel = min_per_channel.unsqueeze(-1)  # [C, 1, 1]
+                # max_per_channel = max_per_channel.unsqueeze(-1)  # [C, 1, 1]
+                # # Avoid division by zero
+                # range_per_channel = max_per_channel - min_per_channel
+                # range_per_channel = torch.clamp(range_per_channel, min=1e-8)
+                # pseudolabel_probs_b = (pseudolabel_probs_b - min_per_channel) / range_per_channel
+                
+                # # Normalize per pixel to restore valid probabilities
+                # pixel_sums = pseudolabel_probs_b.sum(dim=0, keepdim=True)  # [1, H, W]
+                # pixel_sums = torch.clamp(pixel_sums, min=1e-8)
+                # pseudolabel_probs_b = pseudolabel_probs_b / pixel_sums
                 
                 # Map to full class space [NUM_CLASSES, H_seg, W_seg]
                 if len(class_indices) == 0:
@@ -372,7 +405,7 @@ def main():
     for i in range(0, len(original_train_dataset), config['visualization']['train_sample_interval']):
         vis_train_sample_img(
             original_train_dataset, train_dataset, model, i, DISTANCE_TRANSFORM, vis_output_dir,
-            text_model=text_model, tokenizer=tokenizer, config=config, 
+            text_emb_all=text_emb_all, num_all_fg=num_all_fg, num_bg=num_bg,
             fastsam_model=fastsam_model, num_classes=NUM_CLASSES
         )
     vis_train_loss(NUM_EPOCHS, epoch_total_losses, epoch_unary_losses, epoch_pairwise_losses, vis_output_dir)

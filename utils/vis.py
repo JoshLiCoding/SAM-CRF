@@ -29,7 +29,7 @@ def visualize_soft_probabilities(logits, softmax=True):
     return soft_vis
 
 def vis_train_sample_img(original_train_dataset, train_dataset, model, index, distance_transform, output_dir, 
-                        text_model, tokenizer, config, fastsam_model, num_classes):
+                        text_emb_all, num_all_fg, num_bg, fastsam_model, num_classes):
     """
     Visualize training sample following the same procedure as the training loop.
     
@@ -40,9 +40,9 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
         index: Index of sample to visualize
         distance_transform: Distance transform type for pairwise affinity
         output_dir: Directory to save visualization
-        text_model: Text encoder model for pseudolabel generation
-        tokenizer: Tokenizer for text encoding
-        config: Configuration dictionary
+        text_emb_all: Precomputed text embeddings for all classes [num_all_classes, D]
+        num_all_fg: Number of foreground classes
+        num_bg: Number of background classes
         fastsam_model: FastSAM model instance
         num_classes: Number of classes
     """
@@ -63,9 +63,9 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
         segmentations = model_outputs['seg']  # [1, C, H, W]
         dinotxt_patch_tokens = model_outputs['dinotxt']  # [1, P, D]
         
-        # Generate pseudolabels from dino.txt patch tokens
+        # Generate pseudolabels from dino.txt patch tokens using precomputed text embeddings
         pseudolabels_batch, class_indices_batch = generate_pseudolabels_batch(
-            dinotxt_patch_tokens, target_batch, config, text_model, tokenizer
+            dinotxt_patch_tokens, target_batch, text_emb_all, num_all_fg, num_bg
         )
         
         # Convert pseudolabels to tensor format matching segmentation output
@@ -87,6 +87,22 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
             # Softmax with temperature
             t = 0.03
             pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
+            
+            # # Apply per-channel min-max normalization
+            # # pseudolabel_probs_b shape: [C, H, W]
+            # min_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0]  # [C, 1]
+            # max_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0]  # [C, 1]
+            # min_per_channel = min_per_channel.unsqueeze(-1)  # [C, 1, 1]
+            # max_per_channel = max_per_channel.unsqueeze(-1)  # [C, 1, 1]
+            # # Avoid division by zero
+            # range_per_channel = max_per_channel - min_per_channel
+            # range_per_channel = torch.clamp(range_per_channel, min=1e-8)
+            # pseudolabel_probs_b = (pseudolabel_probs_b - min_per_channel) / range_per_channel
+            
+            # # Normalize per pixel to restore valid probabilities
+            # pixel_sums = pseudolabel_probs_b.sum(dim=0, keepdim=True)  # [1, H, W]
+            # pixel_sums = torch.clamp(pixel_sums, min=1e-8)
+            # pseudolabel_probs_b = pseudolabel_probs_b / pixel_sums
             
             # Map to full class space [num_classes, H_seg, W_seg]
             if len(class_indices) == 0:

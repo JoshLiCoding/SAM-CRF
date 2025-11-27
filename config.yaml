@@ -9,12 +9,13 @@ model:
   num_conv_blocks: 2
   out_channels: 21
   use_bottleneck: true
+  use_transpose_conv: false
 
 # Training Parameters
 training:
   batch_size: 16
   num_epochs: 10
-  learning_rate: 0.001
+  learning_rate: 0.0001
   weight_decay: 0.0001
   momentum: 0.9
   ignore_index: 255
@@ -39,12 +40,12 @@ dataset:
 directories:
   output: 'output_5'
   checkpoints: 'checkpoints'
-  visualizations: 'vis_{num_epochs}epochs_t=0.03_w=1000'
+  visualizations: 'vis_{num_epochs}epochs_t=0.03_lr=0.0001_w=200_dilate=4_x2'
 
 # File Paths
 paths:
-  model_checkpoint: 'output_5/checkpoints/none.pt'
-  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_w=1000.pt'
+  model_checkpoint: 'output_5/checkpoints/30epochs_t=0.03_lr=0.0001.pt'
+  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_lr=0.0001_w=200_dilate=4_x2.pt'
 
 # Visualization Parameters
 visualization:

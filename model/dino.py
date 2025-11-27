@@ -23,17 +23,19 @@ class DinoWSSS(nn.Module):
     def __init__(
         self,
         backbone_name: str = "dinov3_vitl16",
-        num_transformer_blocks: int = 2,
-        num_conv_blocks: int = 3,
+        num_transformer_blocks: int = 1,
+        num_conv_blocks: int = 2,
         out_channels: int = 21,
         transformer_drop_path: float = 0.0,
         use_bottleneck: bool = False,
+        use_transpose_conv: bool = False,
     ):
         super().__init__()
 
         self.num_transformer_blocks = num_transformer_blocks
         self.num_conv_blocks = num_conv_blocks
         self.use_bottleneck = use_bottleneck
+        self.use_transpose_conv = use_transpose_conv
 
         # Load backbone and dino.txt head together so backbone is only loaded once
         self.backbone, self.dinotxt_head = self._load_pretrained_backbone_and_dinotxt_head(backbone_name)
@@ -89,6 +91,25 @@ class DinoWSSS(nn.Module):
             ]
         self.conv_blocks = nn.ModuleList(conv_list)
         self.lin_classifier = nn.Conv2d(self.backbone_dim, out_channels, kernel_size=1, padding=0, bias=True)
+        
+        # Transpose convolutions for upsampling (if enabled)
+        if use_transpose_conv:
+            # Two depthwise transpose convs, each upsampling 2x (total 4x upsampling)
+            # kernel_size=3, stride=2, padding=1, output_padding=1 gives 2x upsampling
+            # groups=backbone_dim makes it depthwise (1 filter per input channel)
+            self.upsample_conv1 = nn.ConvTranspose2d(
+                self.backbone_dim, self.backbone_dim, 
+                kernel_size=3, stride=2, padding=1, output_padding=1, 
+                groups=self.backbone_dim, bias=False
+            )
+            self.upsample_conv2 = nn.ConvTranspose2d(
+                self.backbone_dim, self.backbone_dim,
+                kernel_size=3, stride=2, padding=1, output_padding=1,
+                groups=self.backbone_dim, bias=False
+            )
+            # Initialize transpose convs to mimic bilinear upsampling
+            self._init_bilinear_transpose_conv(self.upsample_conv1)
+            self._init_bilinear_transpose_conv(self.upsample_conv2)
 
         self.init_weights()
 
@@ -116,6 +137,30 @@ class DinoWSSS(nn.Module):
         dinotxt_head = dinotxt_model.visual_model.head
         return backbone, dinotxt_head
 
+    def _init_bilinear_transpose_conv(self, conv_transpose):
+        """
+        Initialize depthwise ConvTranspose2d weights to mimic bilinear upsampling.
+        For 2x upsampling with kernel_size=3, stride=2, padding=1, output_padding=1.
+        
+        This creates a bilinear interpolation kernel that matches PyTorch's
+        F.interpolate(..., mode='bilinear', align_corners=False) behavior.
+        """
+        kernel_size = conv_transpose.kernel_size[0]
+
+        filt = np.array([
+            [0.25, 0.5, 0.25],
+            [0.5,  1.0, 0.5],
+            [0.25, 0.5, 0.25]
+        ], dtype=np.float32)
+        
+        # Set weights: for depthwise convolution, weight shape is [out_channels, 1, kernel_h, kernel_w]
+        # Each channel gets its own copy of the bilinear kernel
+        with torch.no_grad():
+            weight = torch.zeros(conv_transpose.weight.shape, dtype=torch.float32)
+            for i in range(conv_transpose.out_channels):
+                weight[i, 0, :, :] = torch.from_numpy(filt)
+            conv_transpose.weight.copy_(weight)
+    
     def init_weights(self):
         """Initialize weights for segmentation blocks"""
         if self.num_transformer_blocks > 0:
@@ -177,7 +222,13 @@ class DinoWSSS(nn.Module):
 
         # Upsample patch tokens to original image size (4x downsampled)
         H, W = x.shape[2:]
-        patch_tokens_spatial = F.interpolate(patch_tokens_spatial, size=(H // 4, W // 4), mode='bilinear', align_corners=False)
+        if self.use_transpose_conv:
+            # Use transpose convolutions for upsampling (2x2 = 4x total)
+            patch_tokens_spatial = self.upsample_conv1(patch_tokens_spatial)
+            patch_tokens_spatial = self.upsample_conv2(patch_tokens_spatial)
+        else:
+            # Use bilinear interpolation (original method)
+            patch_tokens_spatial = F.interpolate(patch_tokens_spatial, size=(H // 4, W // 4), mode='bilinear', align_corners=False)
 
         # Process through conv blocks
         for conv_block in self.conv_blocks:
