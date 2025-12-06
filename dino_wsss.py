@@ -290,7 +290,7 @@ def main():
             unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
 
             # pairwise potential
-            pairwise_loss = PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, DISTANCE_TRANSFORM)
+            pairwise_loss = torch.tensor(0.0, device=device) # PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, DISTANCE_TRANSFORM)
 
             total_loss = unary_loss + pairwise_loss
 

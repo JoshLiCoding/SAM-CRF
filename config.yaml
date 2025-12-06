@@ -40,12 +40,12 @@ dataset:
 directories:
   output: 'output_5'
   checkpoints: 'checkpoints'
-  visualizations: 'vis_{num_epochs}epochs_t=0.03_lr=0.0001_w=200_dilate=4_x2'
+  visualizations: 'vis_{num_epochs}epochs_t=0.03_lr=0.0001'
 
 # File Paths
 paths:
-  model_checkpoint: 'output_5/checkpoints/30epochs_t=0.03_lr=0.0001.pt'
-  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_lr=0.0001_w=200_dilate=4_x2.pt'
+  model_checkpoint: 'output_5/checkpoints/none.pt'
+  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_lr=0.0001.pt'
 
 # Visualization Parameters
 visualization:
