@@ -179,8 +179,6 @@ def main():
     optimizer_params = [
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
-        {'params': model.image_proj.parameters(), 'lr': LEARNING_RATE},
-        {'params': model.image_merge.parameters(), 'lr': LEARNING_RATE},
         {'params': model.conv_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.lin_classifier.parameters(), 'lr': LEARNING_RATE},
     ]
@@ -330,10 +328,7 @@ def main():
             unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
 
             # pairwise potential
-            pairwise_loss = PottsLoss(
-               POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch,
-               use_color_diff=(CONTOUR_METHOD == 'color_diff')
-            )
+            pairwise_loss = torch.tensor(0.0, device=device) # PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, use_color_diff=(CONTOUR_METHOD == 'color_diff'))
 
             total_loss = unary_loss + pairwise_loss
 

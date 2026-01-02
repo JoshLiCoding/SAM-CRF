@@ -6,7 +6,6 @@
 #SBATCH --mem=100GB
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
-#SBATCH --partition=VISION
 
 # Set output file destinations (optional)
 # By default, output will appear in a file in the submission directory:
