@@ -92,6 +92,22 @@ class DinoWSSS(nn.Module):
         self.conv_blocks = nn.ModuleList(conv_list)
         self.lin_classifier = nn.Conv2d(self.backbone_dim, out_channels, kernel_size=1, padding=0, bias=True)
         
+        # Image projection for edge detection: process original image with stride-2 convolutions
+        self.image_feat_dim = 64  # Dimension of processed image features
+        self.image_proj = nn.Sequential(
+            nn.Conv2d(3, self.image_feat_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(self.image_feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.image_feat_dim, self.image_feat_dim, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(self.image_feat_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.image_merge = nn.Sequential(
+            nn.Conv2d(self.backbone_dim + self.image_feat_dim, self.backbone_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.backbone_dim),
+            nn.ReLU(inplace=True)
+        )
+        
         # Transpose convolutions for upsampling (if enabled)
         if use_transpose_conv:
             # Two depthwise transpose convs, each upsampling 2x (total 4x upsampling)
@@ -176,7 +192,24 @@ class DinoWSSS(nn.Module):
                         nn.init.constant_(m.weight, 1)
                         nn.init.constant_(m.bias, 0)
         
-        nn.init.kaiming_normal_(self.lin_classifier.weight, mode='fan_out', nonlinearity='relu')
+        # Initialize image projection layers for edge detection
+        for m in self.image_proj.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
+        # Initialize image merge layer
+        for m in self.image_merge.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
+        # nn.init.kaiming_normal_(self.lin_classifier.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.normal_(self.lin_classifier.weight, mean=0.0, std=0.5)
         nn.init.constant_(self.lin_classifier.bias, 0)
     
     def get_backbone_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -222,13 +255,22 @@ class DinoWSSS(nn.Module):
 
         # Upsample patch tokens to original image size (4x downsampled)
         H, W = x.shape[2:]
+        target_h, target_w = H // 4, W // 4
         if self.use_transpose_conv:
             # Use transpose convolutions for upsampling (2x2 = 4x total)
             patch_tokens_spatial = self.upsample_conv1(patch_tokens_spatial)
             patch_tokens_spatial = self.upsample_conv2(patch_tokens_spatial)
         else:
             # Use bilinear interpolation (original method)
-            patch_tokens_spatial = F.interpolate(patch_tokens_spatial, size=(H // 4, W // 4), mode='bilinear', align_corners=False)
+            patch_tokens_spatial = F.interpolate(patch_tokens_spatial, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+        # Concatenate original image features for edge detection
+        # Process original image through stride-2 convolutions (naturally downsamples by 4x)
+        image_features = self.image_proj(x)  # (B, image_feat_dim, H//4, W//4)
+        # Concatenate image features with patch tokens
+        patch_tokens_spatial = torch.cat([patch_tokens_spatial, image_features], dim=1)  # (B, backbone_dim + image_feat_dim, H//4, W//4)
+        # Merge concatenated features to backbone_dim for conv blocks
+        patch_tokens_spatial = self.image_merge(patch_tokens_spatial)  # (B, backbone_dim, H//4, W//4)
 
         # Process through conv blocks
         for conv_block in self.conv_blocks:

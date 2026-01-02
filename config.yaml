@@ -8,14 +8,14 @@ model:
   num_transformer_blocks: 1
   num_conv_blocks: 2
   out_channels: 21
-  use_bottleneck: true
+  use_bottleneck: false
   use_transpose_conv: false
 
 # Training Parameters
 training:
   batch_size: 16
   num_epochs: 10
-  learning_rate: 0.0001
+  learning_rate: 0.001
   weight_decay: 0.0001
   momentum: 0.9
   ignore_index: 255
@@ -25,7 +25,7 @@ training:
 # Loss Parameters
 loss:
   potts_type: 'quadratic'
-  distance_transform: null
+  contour_method: 'gt'  # 'sam', 'fastsam', 'sam', 'gt', 'color_diff'
 
 # Dataset Parameters
 dataset:
@@ -38,14 +38,15 @@ dataset:
 
 # Directory Structure
 directories:
-  output: 'output_5'
+  output: 'output_9'
   checkpoints: 'checkpoints'
-  visualizations: 'vis_{num_epochs}epochs_t=0.03_lr=0.0001'
+  visualizations: 'vis_{num_epochs}epochs_t=0.05mm_std=0.5_w=100_sam_b'
 
 # File Paths
 paths:
-  model_checkpoint: 'output_5/checkpoints/none.pt'
-  model: 'output_5/checkpoints/{num_epochs}epochs_t=0.03_lr=0.0001.pt'
+  model_checkpoint: 'output_9/checkpoints/10epochs_t=0.05mm_std=0.5.pt'
+  model: 'output_9/checkpoints/{num_epochs}epochs_t=0.05mm_std=0.5_w=100_sam_b.pt'
+  sam_checkpoint: 'sam_checkpoint/sam_vit_b_01ec64.pth'
 
 # Visualization Parameters
 visualization:

@@ -12,6 +12,7 @@ import yaml
 import wandb
 from ultralytics import FastSAM
 import ultralytics
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 from model.dino import DinoWSSS
 from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
@@ -20,7 +21,7 @@ from model.dino_txt_full_img import generate_pseudolabels_batch, build_text_embe
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
 from utils.loss import CollisionCrossEntropyLoss, PottsLoss
 from utils.metrics import update_miou
-from utils.sam import generate_sam_contours_batch
+from utils.sam import generate_sam_contours_batch, generate_fastsam_contours_batch, generate_gt_contours_batch, generate_color_diff_contours_batch
 from utils.vis import vis_train_sample_img, vis_val_sample_img, vis_train_loss, vis_val_loss
 import sys
 DINOV3_LOCATION = '/u501/j234li/wsss/model/dinov3'
@@ -63,7 +64,7 @@ MOMENTUM = config['training']['momentum']
 IGNORE_INDEX = config['training']['ignore_index']
 VALIDATION_INTERVAL = config['training']['validation_interval']
 POTTS_TYPE = config['loss']['potts_type']
-DISTANCE_TRANSFORM = config['loss']['distance_transform']
+CONTOUR_METHOD = config['loss']['contour_method']
 TRAIN_ONLY = config['training']['train_only']
 CLASS_NAMES = {0: "background", 1: "aeroplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "diningtable", 12: "dog", 13: "horse", 14: "motorbike", 15: "person", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "tv/monitor", 255: "ignore"}
 
@@ -77,7 +78,8 @@ for dir_name, dir_path in DIRS.items():
     full_path = os.path.join(DIRS['output'], dir_path) if dir_name != 'output' else dir_path
     os.makedirs(full_path, exist_ok=True)
 PATHS = {
-    'model': config['paths']['model'].format(num_epochs=NUM_EPOCHS)
+    'model': config['paths']['model'].format(num_epochs=NUM_EPOCHS),
+    'sam_checkpoint': config['paths']['sam_checkpoint']
 }
 
 def main():
@@ -135,6 +137,16 @@ def main():
     # Initialize FastSAM model for batch processing
     fastsam_model = FastSAM('FastSAM-x.pt')
     
+    # Initialize SAM model for automatic mask generation (if needed)
+    sam_model = None
+    sam_mask_generator = None
+    if CONTOUR_METHOD == 'sam':
+        sam_checkpoint = PATHS['sam_checkpoint']
+        model_type = "vit_b"  # or "vit_b", "vit_l" depending on checkpoint
+        sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(device)
+        sam_mask_generator = SamAutomaticMaskGenerator(model=sam_model, points_per_batch=256)
+        print("SAM model initialized for automatic mask generation")
+    
     # Initialize DinoTxt model and tokenizer for pseudolabel generation
     text_model, tokenizer = torch.hub.load(
         DINOV3_LOCATION,
@@ -167,6 +179,8 @@ def main():
     optimizer_params = [
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.image_proj.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.image_merge.parameters(), 'lr': LEARNING_RATE},
         {'params': model.conv_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.lin_classifier.parameters(), 'lr': LEARNING_RATE},
     ]
@@ -207,6 +221,8 @@ def main():
     
     for epoch in tqdm(range(NUM_EPOCHS), desc="Training epochs"):
         model.train()
+        model.backbone.eval()
+        model.dinotxt_head.eval()
         
         running_total_loss = 0.0
         running_unary_loss = 0.0
@@ -244,25 +260,21 @@ def main():
                 pseudolabel_tensor = F.interpolate(pseudolabel_tensor, size=(H_seg, W_seg), mode='bilinear', align_corners=False)
                 pseudolabel_tensor = pseudolabel_tensor[0]  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg] (C, H, W)
                 
+                # argmax
+                # num_classes_in_pseudolabel = pseudolabel_tensor.shape[0]
+                # argmax_indices = torch.argmax(pseudolabel_tensor, dim=0)  # [H_seg, W_seg]
+                # pseudolabel_probs_b = F.one_hot(argmax_indices, num_classes=num_classes_in_pseudolabel).float()  # [H_seg, W_seg, num_classes]
+                # pseudolabel_probs_b = pseudolabel_probs_b.permute(2, 0, 1)  # [num_classes, H_seg, W_seg]
+                
                 # Softmax with temperature
-                t = 0.03
-                pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
+                t = 0.05
+                pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)
                 
-                # # Apply per-channel min-max normalization
-                # # pseudolabel_probs_b shape: [C, H, W]
-                # min_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0]  # [C, 1]
-                # max_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0]  # [C, 1]
-                # min_per_channel = min_per_channel.unsqueeze(-1)  # [C, 1, 1]
-                # max_per_channel = max_per_channel.unsqueeze(-1)  # [C, 1, 1]
-                # # Avoid division by zero
-                # range_per_channel = max_per_channel - min_per_channel
-                # range_per_channel = torch.clamp(range_per_channel, min=1e-8)
-                # pseudolabel_probs_b = (pseudolabel_probs_b - min_per_channel) / range_per_channel
-                
-                # # Normalize per pixel to restore valid probabilities
-                # pixel_sums = pseudolabel_probs_b.sum(dim=0, keepdim=True)  # [1, H, W]
-                # pixel_sums = torch.clamp(pixel_sums, min=1e-8)
-                # pseudolabel_probs_b = pseudolabel_probs_b / pixel_sums
+                # Min-max normalize channel-wise, then renormalize to probability simplex
+                min_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
+                max_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
+                pseudolabel_probs_b = (pseudolabel_probs_b - min_vals) / (max_vals - min_vals + 1e-8)
+                pseudolabel_probs_b = pseudolabel_probs_b / (pseudolabel_probs_b.sum(dim=0, keepdim=True) + 1e-8)
                 
                 # Map to full class space [NUM_CLASSES, H_seg, W_seg]
                 if len(class_indices) == 0:
@@ -273,24 +285,55 @@ def main():
                         pseudolabel_probs[b, class_idx] = pseudolabel_probs_b[idx]
                     pseudolabel_probs[b, 0] = pseudolabel_probs_b[len(class_indices)]  # background
             
-            images_pil = []
-            for img in transformed_images:
-                img_denorm = train_dataset.denormalize(img.clone())
-                img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-                img_np = (img_np * 255).astype(np.uint8)
-                images_pil.append(Image.fromarray(img_np))
+            # Generate contours based on the selected method
+            if CONTOUR_METHOD == 'gt':
+                sam_contours_x_batch, sam_contours_y_batch = generate_gt_contours_batch(targets, device)
+            elif CONTOUR_METHOD == 'color_diff':
+                # Denormalize images for color difference computation
+                images_denorm = []
+                for img in transformed_images:
+                    images_denorm.append(train_dataset.denormalize(img.clone()))
+                images_denorm_batch = torch.stack(images_denorm).to(device)  # (B, C, H, W) in [0, 1]
+                # Resize to segmentation size
+                images_denorm_batch = F.interpolate(images_denorm_batch, size=(segmentations.shape[2], segmentations.shape[3]), mode='bilinear', align_corners=False)
+                sam_contours_x_batch, sam_contours_y_batch = generate_color_diff_contours_batch(images_denorm_batch, device)
+            elif CONTOUR_METHOD == 'sam':
+                # Convert images to PIL format
+                images_pil = []
+                for img in transformed_images:
+                    img_denorm = train_dataset.denormalize(img.clone())
+                    img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
+                    images_pil.append(Image.fromarray((img_np * 255).astype(np.uint8)))
+                
+                # Use SAM automatic mask generator to generate contours
+                sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
+                    sam_mask_generator, images_pil, device
+                )
+                sam_contours_x_batch = sam_contours_x_batch.to(device)
+                sam_contours_y_batch = sam_contours_y_batch.to(device)
+            elif CONTOUR_METHOD == 'fastsam':
+                # Convert images to PIL format
+                images_pil = []
+                for img in transformed_images:
+                    img_denorm = train_dataset.denormalize(img.clone())
+                    img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
+                    images_pil.append(Image.fromarray((img_np * 255).astype(np.uint8)))
+                
+                # Use FastSAM to generate contours
+                sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
+                    fastsam_model, images_pil, device
+                )
+                sam_contours_x_batch = sam_contours_x_batch.to(device)
+                sam_contours_y_batch = sam_contours_y_batch.to(device)
             
-            sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
-                fastsam_model, images_pil, device
-            )
-            sam_contours_x_batch = sam_contours_x_batch.to(device)
-            sam_contours_y_batch = sam_contours_y_batch.to(device)
-
             # unary potential
             unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
 
             # pairwise potential
-            pairwise_loss = torch.tensor(0.0, device=device) # PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, DISTANCE_TRANSFORM)
+            pairwise_loss = PottsLoss(
+               POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch,
+               use_color_diff=(CONTOUR_METHOD == 'color_diff')
+            )
 
             total_loss = unary_loss + pairwise_loss
 
@@ -404,9 +447,10 @@ def main():
     vis_output_dir = os.path.join(DIRS['output'], DIRS['visualizations'])
     for i in range(0, len(original_train_dataset), config['visualization']['train_sample_interval']):
         vis_train_sample_img(
-            original_train_dataset, train_dataset, model, i, DISTANCE_TRANSFORM, vis_output_dir,
+            original_train_dataset, train_dataset, model, i, vis_output_dir,
             text_emb_all=text_emb_all, num_all_fg=num_all_fg, num_bg=num_bg,
-            fastsam_model=fastsam_model, num_classes=NUM_CLASSES
+            fastsam_model=fastsam_model, sam_mask_generator=sam_mask_generator, num_classes=NUM_CLASSES,
+            contour_method=CONTOUR_METHOD
         )
     vis_train_loss(NUM_EPOCHS, epoch_total_losses, epoch_unary_losses, epoch_pairwise_losses, vis_output_dir)
     

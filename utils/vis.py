@@ -8,7 +8,7 @@ from PIL import Image
 from utils.loss import calculate_pairwise_affinity
 from utils.dataset import cmap
 from model.dino_txt_full_img import generate_pseudolabels_batch
-from utils.sam import generate_sam_contours_batch
+from utils.sam import generate_sam_contours_batch, generate_fastsam_contours_batch, generate_gt_contours_batch, generate_color_diff_contours_batch
 
 def visualize_soft_probabilities(logits, softmax=True):
     if softmax:
@@ -28,8 +28,9 @@ def visualize_soft_probabilities(logits, softmax=True):
     soft_vis = np.clip(soft_vis*255, 0, 255).astype(np.uint8)
     return soft_vis
 
-def vis_train_sample_img(original_train_dataset, train_dataset, model, index, distance_transform, output_dir, 
-                        text_emb_all, num_all_fg, num_bg, fastsam_model, num_classes):
+def vis_train_sample_img(original_train_dataset, train_dataset, model, index, output_dir, 
+                        text_emb_all, num_all_fg, num_bg, fastsam_model, sam_mask_generator, num_classes,
+                        contour_method):
     """
     Visualize training sample following the same procedure as the training loop.
     
@@ -38,12 +39,12 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
         train_dataset: Transformed dataset (for getting transformed image and target)
         model: Segmentation model
         index: Index of sample to visualize
-        distance_transform: Distance transform type for pairwise affinity
         output_dir: Directory to save visualization
         text_emb_all: Precomputed text embeddings for all classes [num_all_classes, D]
         num_all_fg: Number of foreground classes
         num_bg: Number of background classes
         fastsam_model: FastSAM model instance
+        sam_mask_generator: SAM automatic mask generator instance (can be None)
         num_classes: Number of classes
     """
     device = next(model.parameters()).device
@@ -84,25 +85,21 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
             pseudolabel_tensor = F.interpolate(pseudolabel_tensor, size=(H_seg, W_seg), mode='bilinear', align_corners=False)
             pseudolabel_tensor = pseudolabel_tensor[0]  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg] (C, H, W)
             
+            # argmax
+            # num_classes_in_pseudolabel = pseudolabel_tensor.shape[0]
+            # argmax_indices = torch.argmax(pseudolabel_tensor, dim=0)  # [H_seg, W_seg]
+            # pseudolabel_probs_b = F.one_hot(argmax_indices, num_classes=num_classes_in_pseudolabel).float()  # [H_seg, W_seg, num_classes]
+            # pseudolabel_probs_b = pseudolabel_probs_b.permute(2, 0, 1)  # [num_classes, H_seg, W_seg]
+            
             # Softmax with temperature
-            t = 0.03
+            t = 0.05
             pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
             
-            # # Apply per-channel min-max normalization
-            # # pseudolabel_probs_b shape: [C, H, W]
-            # min_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0]  # [C, 1]
-            # max_per_channel = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0]  # [C, 1]
-            # min_per_channel = min_per_channel.unsqueeze(-1)  # [C, 1, 1]
-            # max_per_channel = max_per_channel.unsqueeze(-1)  # [C, 1, 1]
-            # # Avoid division by zero
-            # range_per_channel = max_per_channel - min_per_channel
-            # range_per_channel = torch.clamp(range_per_channel, min=1e-8)
-            # pseudolabel_probs_b = (pseudolabel_probs_b - min_per_channel) / range_per_channel
-            
-            # # Normalize per pixel to restore valid probabilities
-            # pixel_sums = pseudolabel_probs_b.sum(dim=0, keepdim=True)  # [1, H, W]
-            # pixel_sums = torch.clamp(pixel_sums, min=1e-8)
-            # pseudolabel_probs_b = pseudolabel_probs_b / pixel_sums
+            # Min-max normalize channel-wise, then renormalize to probability simplex
+            min_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
+            max_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
+            pseudolabel_probs_b = (pseudolabel_probs_b - min_vals) / (max_vals - min_vals + 1e-8)
+            pseudolabel_probs_b = pseudolabel_probs_b / (pseudolabel_probs_b.sum(dim=0, keepdim=True) + 1e-8)
             
             # Map to full class space [num_classes, H_seg, W_seg]
             if len(class_indices) == 0:
@@ -115,16 +112,39 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
         
         pseudolabel_probs_vis = pseudolabel_probs[0]  # [num_classes, H_seg, W_seg]
         
-        # Generate SAM contours
-        images_pil = []
-        img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
-        img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-        img_np = (img_np * 255).astype(np.uint8)
-        images_pil.append(Image.fromarray(img_np))
+        # Generate contours based on the selected method
+        if contour_method == 'gt':
+            target_batch_tensor = target.unsqueeze(0).to(device)  # [1, H, W]
+            sam_contours_x_batch, sam_contours_y_batch = generate_gt_contours_batch(
+                target_batch_tensor, device
+            )
+        elif contour_method == 'color_diff':
+            img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
+            H_seg, W_seg = segmentations.shape[2], segmentations.shape[3]
+            img_denorm_batch = img_denorm.unsqueeze(0)  # [1, C, H_orig, W_orig]
+            img_denorm_batch = F.interpolate(img_denorm_batch, size=(H_seg, W_seg), mode='bilinear', align_corners=False).to(device)
+            sam_contours_x_batch, sam_contours_y_batch = generate_color_diff_contours_batch(img_denorm_batch, device)
+        elif contour_method == 'sam':
+            img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
+            img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
+            images_pil = [Image.fromarray((img_np * 255).astype(np.uint8))]
+            
+            # Use SAM automatic mask generator to generate contours
+            sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
+                sam_mask_generator, images_pil, device
+            )
+        elif contour_method == 'fastsam':
+            img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
+            img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
+            images_pil = [Image.fromarray((img_np * 255).astype(np.uint8))]
+            
+            # Use FastSAM to generate contours
+            sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
+                fastsam_model, images_pil, device
+            )
+        else:
+            raise ValueError(f"Unknown contour_method: {contour_method}. Must be one of: 'sam', 'fastsam', 'gt', 'color_diff'")
         
-        sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
-            fastsam_model, images_pil, device
-        )
         sam_contours_x = sam_contours_x_batch[0].cpu().numpy()  # [H, W-1]
         sam_contours_y = sam_contours_y_batch[0].cpu().numpy()  # [H-1, W]
     
@@ -145,7 +165,7 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
     output_vis = original_train_dataset.decode_target(output_vis)
     
     # Create visualization
-    fig, axes = plt.subplots(7, 2, figsize=(8, 24))
+    fig, axes = plt.subplots(7, 2, figsize=(8, 32))
     
     axes[0, 0].imshow(img)
     axes[0, 0].set_title('Original Image')
@@ -164,19 +184,23 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
     axes[2, 1].imshow(pseudolabels_vis)
     axes[2, 1].set_title('Pseudolabels')
 
-    axes[3, 0].imshow(sam_contours_x, cmap='gray')
-    axes[3, 0].set_title('SAM Contours (horizontal)')
+    contour_title = f'{contour_method.upper()} Contours'
+    axes[3, 0].imshow(sam_contours_x, cmap='gray', vmin=0, vmax=1)
+    axes[3, 0].set_title(f'{contour_title} (horizontal)')
 
-    axes[3, 1].imshow(sam_contours_y, cmap='gray')
-    axes[3, 1].set_title('SAM Contours (vertical)')
+    axes[3, 1].imshow(sam_contours_y, cmap='gray', vmin=0, vmax=1)
+    axes[3, 1].set_title(f'{contour_title} (vertical)')
 
     sam_contours_x_tensor = sam_contours_x_batch[0:1].to(device)  # [1, H, W-1]
     sam_contours_y_tensor = sam_contours_y_batch[0:1].to(device)  # [1, H-1, W]
-    axes[4, 0].imshow(calculate_pairwise_affinity(sam_contours_x_tensor, distance_transform).squeeze(0).cpu().numpy(), cmap='gray')
-    axes[4, 0].set_title('SAM Distance Field (horizontal)')
+    # For color_diff, contours are already weights; for others, negate to get distance field
+    w_x_vis = sam_contours_x_tensor.squeeze(0).cpu().numpy() if contour_method == 'color_diff' else calculate_pairwise_affinity(sam_contours_x_tensor).squeeze(0).cpu().numpy()
+    w_y_vis = sam_contours_y_tensor.squeeze(0).cpu().numpy() if contour_method == 'color_diff' else calculate_pairwise_affinity(sam_contours_y_tensor).squeeze(0).cpu().numpy()
+    axes[4, 0].imshow(w_x_vis, cmap='gray', vmin=0, vmax=1)
+    axes[4, 0].set_title(f'{contour_title} Distance Field (horizontal)')
 
-    axes[4, 1].imshow(calculate_pairwise_affinity(sam_contours_y_tensor, distance_transform).squeeze(0).cpu().numpy(), cmap='gray')
-    axes[4, 1].set_title('SAM Distance Field (vertical)')
+    axes[4, 1].imshow(w_y_vis, cmap='gray', vmin=0, vmax=1)
+    axes[4, 1].set_title(f'{contour_title} Distance Field (vertical)')
 
     axes[5, 0].imshow(soft_output)
     axes[5, 0].set_title('Soft Model Output')
@@ -192,13 +216,13 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, di
     expanded_sam_contours_x[:, :sam_contours_x.shape[1]] = sam_contours_x
     axes[6, 0].imshow(expanded_sam_contours_x, alpha=0.5, cmap='gray')
     axes[6, 0].imshow(soft_output, alpha=0.5)
-    axes[6, 0].set_title('Soft Model Output & SAM Contours (horizontal)')
+    axes[6, 0].set_title(f'Soft Model Output & {contour_title} (horizontal)')
 
     expanded_sam_contours_y = np.zeros((H, W), dtype=np.float32)
     expanded_sam_contours_y[:sam_contours_y.shape[0], :] = sam_contours_y
     axes[6, 1].imshow(expanded_sam_contours_y, alpha=0.5, cmap='gray')
     axes[6, 1].imshow(soft_output, alpha=0.5)
-    axes[6, 1].set_title('Soft Model Output & SAM Contours (vertical)')
+    axes[6, 1].set_title(f'Soft Model Output & {contour_title} (vertical)')
     
     plt.tight_layout()
     save_path = os.path.join(output_dir, f'visualization_sample_{index}.png')

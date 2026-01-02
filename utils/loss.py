@@ -4,32 +4,20 @@ from scipy import ndimage
 import numpy as np
 import matplotlib.pyplot as plt
 
-def calculate_pairwise_affinity(sam_contour, transform_type):
+def calculate_pairwise_affinity(sam_contour):
     device = sam_contour.device
 
-    # dilate by 4
-    sam_contour_cpu = sam_contour.cpu().numpy()
-    dilated_contour = np.zeros_like(sam_contour_cpu)
-    for i in range(sam_contour_cpu.shape[0]):
-        dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=4)
-    sam_contour = torch.from_numpy(dilated_contour).to(device)
+    # dilate by 2
+    # sam_contour_cpu = sam_contour.cpu().numpy()
+    # dilated_contour = np.zeros_like(sam_contour_cpu)
+    # for i in range(sam_contour_cpu.shape[0]):
+    #     dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=2)
+    # sam_contour = torch.from_numpy(dilated_contour).to(device)
 
-    if transform_type is None:
-        w = (~sam_contour.bool()).to(torch.float32)
-    else:
-        sam_contour_cpu = sam_contour.cpu().numpy()
-        w = np.zeros(sam_contour_cpu.shape)
-        for i in range(sam_contour_cpu.shape[0]):
-            if transform_type == 'euclidean':
-                w[i] = ndimage.distance_transform_edt(~sam_contour_cpu[i].astype(bool))
-            elif transform_type == 'exponential':
-                # T = 20
-                w[i] = np.exp(ndimage.distance_transform_edt(~sam_contour_cpu[i].astype(bool)) / 20.0) * 20.0
-            
-        w = torch.from_numpy(w).to(dtype=torch.float32, device=device)
+    w = (~sam_contour.bool()).to(torch.float32)
     return w
 
-def CollisionCrossEntropyLoss(logits, target_probs):
+def CollisionCrossEntropyLoss(logits, target_probs, use_focal=False, gamma=2.0):
     """
     See "Soft Self-labeling and Potts Relaxations for Weakly-Supervised Segmentation" paper.
     CCE loss is robust to pseudo-label uncertainty without requiring hard labels.
@@ -37,21 +25,48 @@ def CollisionCrossEntropyLoss(logits, target_probs):
     Args:
         logits: (B, C, H, W) tensor of logits from model
         target_probs: (B, C, H, W) tensor of target probabilities (pseudolabels)
-        class_weights: (C,) tensor of class weights for class balancing (optional)
+        use_focal: If True, adds focal loss-like term to the formula
+        gamma: Focusing parameter for focal loss (default: 2.0)
     """
     probs = torch.softmax(logits, dim=1)
     
-    # Compute pixel-wise log probabilities
-    log_sum = torch.log(torch.sum(probs * target_probs, dim=1) + 1e-8)  # (B, H, W)
-    per_pixel_loss = -log_sum  # (B, H, W)
+    # Compute sum_k(σ_i^k * y_i^k) for each pixel
+    sum_probs_target = torch.sum(probs * target_probs, dim=1)  # (B, H, W)
+    
+    # Compute log sum with numerical stability
+    log_sum = torch.log(sum_probs_target + 1e-8)  # (B, H, W)
+    
+    if use_focal:
+        # Focal CCE: -(1 - sum_k(σ_i^k * y_i^k))^γ * ln(sum_k(σ_i^k * y_i^k))
+        focal_weight = torch.pow(1.0 - sum_probs_target, gamma)
+        per_pixel_loss = -focal_weight * log_sum  # (B, H, W)
+    else:
+        # Standard CCE: -ln(sum_k(σ_i^k * y_i^k))
+        per_pixel_loss = -log_sum  # (B, H, W)
     
     loss = per_pixel_loss.mean()
     
     return loss
 
-def PottsLoss(type, logits, sam_contours_x, sam_contours_y, distance_transform):
-    w_x = calculate_pairwise_affinity(sam_contours_x, distance_transform)
-    w_y = calculate_pairwise_affinity(sam_contours_y, distance_transform)
+def PottsLoss(type, logits, sam_contours_x, sam_contours_y, use_color_diff=False):
+    """
+    Potts loss with optional color-difference based weighting.
+    
+    Args:
+        type: Type of Potts loss ('bilinear', 'quadratic', 'log_quadratic')
+        logits: (B, C, H, W) tensor of logits
+        sam_contours_x: (B, H, W-1) tensor of horizontal contours/weights
+        sam_contours_y: (B, H-1, W) tensor of vertical contours/weights
+        use_color_diff: If True, use contours directly as weights (no negation)
+    """
+    if use_color_diff:
+        # For color_diff, contours are already weights, use directly
+        w_x = sam_contours_x
+        w_y = sam_contours_y
+    else:
+        # For other methods, negate contours to get weights
+        w_x = calculate_pairwise_affinity(sam_contours_x)
+        w_y = calculate_pairwise_affinity(sam_contours_y)
     
     if type == 'bilinear':
         weighting = 200.0
@@ -70,7 +85,7 @@ def PottsLoss(type, logits, sam_contours_x, sam_contours_y, distance_transform):
         num_classes = prob.shape[1]
         
         device = prob.device
-        class_weights = torch.full((num_classes,), 200.0, device=device, dtype=prob.dtype)
+        class_weights = torch.full((num_classes,), 100.0, device=device, dtype=prob.dtype)
 
         # List A:
         # class_weights[5] = 500.0    # bottle
