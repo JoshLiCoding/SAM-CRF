@@ -17,7 +17,7 @@ def calculate_pairwise_affinity(sam_contour):
     w = (~sam_contour.bool()).to(torch.float32)
     return w
 
-def CollisionCrossEntropyLoss(logits, target_probs, use_focal=False, gamma=2.0):
+def CollisionCrossEntropyLoss(logits, target_probs, use_focal=True, gamma=2.0):
     """
     See "Soft Self-labeling and Potts Relaxations for Weakly-Supervised Segmentation" paper.
     CCE loss is robust to pseudo-label uncertainty without requiring hard labels.
