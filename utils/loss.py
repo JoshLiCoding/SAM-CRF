@@ -7,17 +7,17 @@ import matplotlib.pyplot as plt
 def calculate_pairwise_affinity(sam_contour):
     device = sam_contour.device
 
-    # dilate by 2
-    # sam_contour_cpu = sam_contour.cpu().numpy()
-    # dilated_contour = np.zeros_like(sam_contour_cpu)
-    # for i in range(sam_contour_cpu.shape[0]):
-    #     dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=2)
-    # sam_contour = torch.from_numpy(dilated_contour).to(device)
+    # dilate by 3
+    sam_contour_cpu = sam_contour.cpu().numpy()
+    dilated_contour = np.zeros_like(sam_contour_cpu)
+    for i in range(sam_contour_cpu.shape[0]):
+        dilated_contour[i] = ndimage.maximum_filter(sam_contour_cpu[i], size=5)
+    sam_contour = torch.from_numpy(dilated_contour).to(device)
 
     w = (~sam_contour.bool()).to(torch.float32)
     return w
 
-def CollisionCrossEntropyLoss(logits, target_probs, use_focal=True, gamma=2.0):
+def CollisionCrossEntropyLoss(logits, target_probs, use_focal=False, gamma=2.0):
     """
     See "Soft Self-labeling and Potts Relaxations for Weakly-Supervised Segmentation" paper.
     CCE loss is robust to pseudo-label uncertainty without requiring hard labels.
@@ -85,39 +85,53 @@ def PottsLoss(type, logits, sam_contours_x, sam_contours_y, use_color_diff=False
         num_classes = prob.shape[1]
         
         device = prob.device
-        class_weights = torch.full((num_classes,), 100.0, device=device, dtype=prob.dtype)
+        class_weights = torch.full((num_classes,), 75.0, device=device, dtype=prob.dtype)
 
-        # List A:
-        # class_weights[5] = 500.0    # bottle
-        # class_weights[11] = 500.0   # diningtable
-        # class_weights[16] = 500.0   # potted plant
+        # dl=3
+        # class_weights[0]  = 0.0  # background
+        # class_weights[1]  = 400.0  # aeroplane (max mIoU: 0.8695)
+        # class_weights[2]  = 100.0  # bicycle (max mIoU: 0.3435)
+        # class_weights[3]  = 300.0  # bird (max mIoU: 0.9204) CHANGED
+        # class_weights[4]  = 100.0   # boat (max mIoU: 0.7245) CHANGED
+        # class_weights[5]  = 50.0   # bottle (max mIoU: 0.7887)
+        # class_weights[6]  = 400.0  # bus (max mIoU: 0.9462)
+        # class_weights[7]  = 200.0  # car (max mIoU: 0.8650)
+        # class_weights[8]  = 300.0  # cat (max mIoU: 0.9618)
+        # class_weights[9]  = 50.0   # chair (max mIoU: 0.4472)
+        # class_weights[10] = 100.0  # cow (max mIoU: 0.9353)
+        # class_weights[11] = 0.0    # diningtable (max mIoU: 0.2975)
+        # class_weights[12] = 200.0  # dog (max mIoU: 0.9464)
+        # class_weights[13] = 200.0  # horse (max mIoU: 0.8835)
+        # class_weights[14] = 200.0  # motorbike (max mIoU: 0.8285)
+        # class_weights[15] = 100.0  # person (max mIoU: 0.8654)
+        # class_weights[16] = 0.0    # potted plant (max mIoU: 0.4653)
+        # class_weights[17] = 200.0  # sheep (max mIoU: 0.9230)
+        # class_weights[18] = 50.0   # sofa (max mIoU: 0.4997)
+        # class_weights[19] = 100.0  # train (max mIoU: 0.8976)
+        # class_weights[20] = 50.0   # tv/monitor (max mIoU: 0.4269)
 
-        # List B:
-        # class_weights[2] = 1300.0   # bicycle
-        # class_weights[4] = 1300.0   # boat
-        # class_weights[20] = 1300.0  # tv/monitor
-        # class_weight[0] = 1300.0  # background
-
-        # List C: aeroplane, bus, car, cat, cow, dog, motorbike, sheep
-        # class_weights[1] = 3000.0   # aeroplane
-        # class_weights[6] = 3000.0   # bus
-        # class_weights[7] = 3000.0   # car
-        # class_weights[8] = 3000.0   # cat
-        # class_weights[10] = 3000.0   # cow
-        # class_weights[12] = 3000.0   # dog
-        # class_weights[14] = 3000.0   # motorbike
-        # class_weights[17] = 3000.0   # sheep
-
-        # List A:
-        # class_weights[5] = 300.0    # bottle
-        # class_weights[11] = 300.0   # diningtable
-        # class_weights[16] = 0.0   # potted plant
-        # class_weights[20] = 300.0  # tv/monitor
-
-        # # List B:
-        # class_weights[2] = 2500.0   # bicycle
-        # class_weights[4] = 2500.0   # boat
-        # class_weights[8] = 2500.0   # cat
+        # dl=5
+        class_weights[0]  = 0.0  # background
+        class_weights[1]  = 400.0  # aeroplane (max mIoU: 0.8895 @ w=400)
+        class_weights[2]  = 100.0  # bicycle (max mIoU: 0.3654 @ w=100)
+        class_weights[3]  = 300.0  # bird (max mIoU: 0.9137 @ w=300)
+        class_weights[4]  = 100.0  # boat (max mIoU: 0.7708 @ w=100)
+        class_weights[5]  = 100.0  # bottle (max mIoU: 0.8162 @ w=100)
+        class_weights[6]  = 300.0  # bus (max mIoU: 0.9403 @ w=300)
+        class_weights[7]  = 200.0  # car (max mIoU: 0.8794 @ w=200)
+        class_weights[8]  = 300.0  # cat (max mIoU: 0.9471 @ w=300)
+        class_weights[9]  = 50.0   # chair (max mIoU: 0.4780 @ w=50)
+        class_weights[10] = 100.0  # cow (max mIoU: 0.9278 @ w=100)
+        class_weights[11] = 50.0   # diningtable (max mIoU: 0.3348 @ w=50)
+        class_weights[12] = 300.0  # dog (max mIoU: 0.9384 @ w=300)
+        class_weights[13] = 300.0  # horse (max mIoU: 0.8749 @ w=300)
+        class_weights[14] = 400.0  # motorbike (max mIoU: 0.8331 @ w=400)
+        class_weights[15] = 100.0  # person (max mIoU: 0.8601 @ w=100)
+        class_weights[16] = 50.0   # potted plant (max mIoU: 0.5051 @ w=50)
+        class_weights[17] = 500.0  # sheep (max mIoU: 0.9204 @ w=500)
+        class_weights[18] = 50.0   # sofa (max mIoU: 0.5157 @ w=50)
+        class_weights[19] = 200.0  # train (max mIoU: 0.9032 @ w=200)
+        class_weights[20] = 50.0   # tv/monitor (max mIoU: 0.5277 @ w=50)
 
         class_weights = class_weights.view(1, num_classes, 1, 1)  # (1, C, 1, 1) for broadcasting
 

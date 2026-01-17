@@ -275,7 +275,7 @@ class CustomSegmentationTrain(Dataset):
         
         # Apply augmentations
         # RandomResizedCrop
-        i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=(0.5, 1.5), ratio=(3. / 4., 4. / 3.))
+        i, j, h, w = transforms.RandomResizedCrop.get_params(image, scale=(0.8, 1.2), ratio=(4. / 5., 5. / 4.))
         image = transforms.functional.crop(image, i, j, h, w)
         target = transforms.functional.crop(target, i, j, h, w)
 

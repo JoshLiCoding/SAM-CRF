@@ -93,12 +93,13 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, ou
             
             # Softmax with temperature
             t = 0.05
-            pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg]
+            pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)
             
             # Min-max normalize channel-wise, then renormalize to probability simplex
             min_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
             max_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
             pseudolabel_probs_b = (pseudolabel_probs_b - min_vals) / (max_vals - min_vals + 1e-8)
+
             pseudolabel_probs_b = pseudolabel_probs_b / (pseudolabel_probs_b.sum(dim=0, keepdim=True) + 1e-8)
             
             # Map to full class space [num_classes, H_seg, W_seg]
@@ -294,6 +295,7 @@ def vis_train_loss(num_epochs, epoch_total_losses, epoch_unary_losses, epoch_pai
     plt.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'train_total_loss.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
     # Graph 2: Individual Loss Components
     plt.figure(figsize=(6, 4))
@@ -308,6 +310,7 @@ def vis_train_loss(num_epochs, epoch_total_losses, epoch_unary_losses, epoch_pai
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'train_individual_losses.png'), dpi=300, bbox_inches='tight')
     plt.close()
+    
     print(f"Training loss visualizations saved")
 
 def vis_val_loss(validation_mious, validation_epochs, output_dir='.'):

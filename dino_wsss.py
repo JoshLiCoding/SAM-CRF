@@ -16,7 +16,6 @@ from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 from model.dino import DinoWSSS
 from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
-from model.scheduler import PolyLR
 from model.dino_txt_full_img import generate_pseudolabels_batch, build_text_embeddings, get_class_names_from_config
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
 from utils.loss import CollisionCrossEntropyLoss, PottsLoss
@@ -144,7 +143,13 @@ def main():
         sam_checkpoint = PATHS['sam_checkpoint']
         model_type = "vit_b"  # or "vit_b", "vit_l" depending on checkpoint
         sam_model = sam_model_registry[model_type](checkpoint=sam_checkpoint).to(device)
-        sam_mask_generator = SamAutomaticMaskGenerator(model=sam_model, points_per_batch=256)
+        sam_mask_generator = SamAutomaticMaskGenerator(
+            model=sam_model,
+            points_per_side=16,
+            points_per_batch=256,
+            pred_iou_thresh=0.8,
+            stability_score_thresh=0.8
+        )
         print("SAM model initialized for automatic mask generation")
     
     # Initialize DinoTxt model and tokenizer for pseudolabel generation
@@ -190,14 +195,6 @@ def main():
         params=optimizer_params,
         lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
     )
-    # scheduler = PolyLR(optimizer, NUM_EPOCHS * len(train_loader), power=0.9)
-
-    # model = deeplabv3_resnet101(NUM_CLASSES).to(device)
-    # optimizer = torch.optim.SGD(params=[
-    #     {'params': model.backbone.parameters(), 'lr': LEARNING_RATE},
-    #     {'params': model.classifier.parameters(), 'lr': LEARNING_RATE},
-    # ], lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-    # scheduler = PolyLR(optimizer, NUM_EPOCHS * len(train_loader), power=0.9)
 
     model_checkpoint = config['paths']['model_checkpoint']
     if os.path.exists(model_checkpoint):
@@ -272,6 +269,7 @@ def main():
                 min_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
                 max_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
                 pseudolabel_probs_b = (pseudolabel_probs_b - min_vals) / (max_vals - min_vals + 1e-8)
+
                 pseudolabel_probs_b = pseudolabel_probs_b / (pseudolabel_probs_b.sum(dim=0, keepdim=True) + 1e-8)
                 
                 # Map to full class space [NUM_CLASSES, H_seg, W_seg]
@@ -328,13 +326,12 @@ def main():
             unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
 
             # pairwise potential
-            pairwise_loss = torch.tensor(0.0, device=device) # PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, use_color_diff=(CONTOUR_METHOD == 'color_diff'))
+            pairwise_loss = PottsLoss(POTTS_TYPE, segmentations, sam_contours_x_batch, sam_contours_y_batch, use_color_diff=(CONTOUR_METHOD == 'color_diff'))
 
             total_loss = unary_loss + pairwise_loss
 
             total_loss.backward()
             optimizer.step()
-            # scheduler.step()
 
             running_total_loss += total_loss.item()
             running_unary_loss += unary_loss.item()
