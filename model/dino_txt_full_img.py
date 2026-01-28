@@ -77,7 +77,8 @@ def get_class_names_from_config(config):
     """
     dataset_name = config['dataset']['dataset_name']
     if dataset_name == 'voc':
-        CLASS_NAMES = {0: "background", 1: "airplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "table", 12: "dog", 13: "horse", 14: "motorcycle", 15: "people", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "television receiver", 255: "ignore"}
+        CLASS_NAMES = {0: "background", 1: "airplane", 2: "bicycle frame and seat", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "table", 12: "dog", 13: "horse", 14: "motorcycle", 15: "people", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "television receiver", 255: "ignore"}
+        # CLASS_NAMES = {0: "background", 1: "airplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "table", 12: "dog", 13: "horse", 14: "motorcycle", 15: "people", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "television receiver", 255: "ignore"}
         BACKGROUND_CLASS_NAMES: Sequence[str] = [
             "ground", "land", "grass", "tree", "building", "wall", "sky", "lake", "water", "river", "sea",
             "railway", "railroad", "keyboard", "helmet", "cloud", "house", "mountain", "ocean", "road",

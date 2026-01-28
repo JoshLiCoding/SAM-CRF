@@ -207,6 +207,50 @@ def get_ground_truth_contours(mask, device):
     return contours_x_tensor, contours_y_tensor
 
 
+def shift_mask(mask, shift_up=1, shift_left=1):
+    """
+    Shift a mask up and left by specified amounts.
+    
+    Args:
+        mask: numpy array [H, W] or torch.Tensor [H, W] with class indices
+        shift_up: Number of pixels to shift up (positive = up)
+        shift_left: Number of pixels to shift left (positive = left)
+    
+    Returns:
+        shifted_mask: Same type as input, shifted mask [H, W]
+    """
+    is_tensor = isinstance(mask, torch.Tensor)
+    if is_tensor:
+        mask_np = mask.cpu().numpy()
+    else:
+        mask_np = mask.copy()
+    
+    H, W = mask_np.shape
+    shifted_mask = np.zeros_like(mask_np)
+    
+    # Shift up and left: new position = old position - shift
+    # For up: row decreases, so we copy from row+shift_up to row
+    # For left: col decreases, so we copy from col+shift_left to col
+    new_h_start = shift_up
+    new_w_start = shift_left
+    new_h_end = H
+    new_w_end = W
+    
+    old_h_start = 0
+    old_w_start = 0
+    old_h_end = H - shift_up
+    old_w_end = W - shift_left
+    
+    # Only copy if there's valid overlap
+    if new_h_end > new_h_start and new_w_end > new_w_start and old_h_end > old_h_start and old_w_end > old_w_start:
+        shifted_mask[new_h_start:new_h_end, new_w_start:new_w_end] = mask_np[old_h_start:old_h_end, old_w_start:old_w_end]
+    
+    if is_tensor:
+        return torch.from_numpy(shifted_mask).to(mask.device).long()
+    else:
+        return shifted_mask.astype(mask.dtype)
+
+
 def create_synthetic_dataset(image, mask, transform):
     """
     Create a dataset-like object for a single image.
@@ -231,7 +275,7 @@ def create_synthetic_dataset(image, mask, transform):
 
 def visualize_results(image_orig, image_down, mask_gt, predictions_down, predictions_orig,
                      contours_gt_x, contours_gt_y, contours_noisy_x, contours_noisy_y,
-                     jittered_mask, jittered_mask_soft_prob, epoch, output_dir, noise_percentage, noise_shift, soft_prob):
+                     shifted_mask, shifted_mask_soft_prob, epoch, output_dir, noise_percentage, noise_shift, soft_prob):
     """
     Visualize training results at different resolutions.
     
@@ -243,8 +287,8 @@ def visualize_results(image_orig, image_down, mask_gt, predictions_down, predict
         predictions_orig: torch.Tensor [C, H_orig, W_orig] model predictions at original resolution
         contours_gt_x, contours_gt_y: Ground truth contours
         contours_noisy_x, contours_noisy_y: Noisy contours used for training
-        jittered_mask: numpy array [H_down, W_down] jittered mask used to generate noisy contours
-        jittered_mask_soft_prob: numpy array [H_down, W_down] soft probability mask (foreground class probability)
+        shifted_mask: numpy array [H_down, W_down] shifted mask used to generate pseudolabel probs
+        shifted_mask_soft_prob: numpy array [H_down, W_down] soft probability mask (foreground class probability)
         epoch: Current epoch
         output_dir: Directory to save visualizations
         noise_percentage: Percentage of noisy boundaries
@@ -343,18 +387,18 @@ def visualize_results(image_orig, image_down, mask_gt, predictions_down, predict
     axes[3, 0].set_title('GT Mask (Downsampled)')
     
     # Show soft probability mask (foreground class probability)
-    axes[3, 1].imshow(jittered_mask_soft_prob, cmap='gray', vmin=0, vmax=1)
-    axes[3, 1].set_title(f'Jittered Mask (Soft Prob, fg={soft_prob:.1f})')
+    axes[3, 1].imshow(shifted_mask_soft_prob, cmap='gray', vmin=0, vmax=1)
+    axes[3, 1].set_title(f'Shifted Mask (Soft Prob, fg={soft_prob:.1f})')
     
-    # Difference between GT and jittered mask (using hard mask)
-    mask_diff = np.abs(mask_gt.astype(float) - jittered_mask.astype(float))
+    # Difference between GT and shifted mask (using hard mask)
+    mask_diff = np.abs(mask_gt.astype(float) - shifted_mask.astype(float))
     axes[3, 2].imshow(mask_diff, cmap='hot')
-    axes[3, 2].set_title('Difference (GT - Jittered)')
+    axes[3, 2].set_title('Difference (GT - Shifted)')
     
     # Overlay soft probability mask on downsampled image
-    overlay_jittered = np.array(image_down).copy()
-    overlay_jittered[:, :, 0] = overlay_jittered[:, :, 0] * (1 - 0.6 * jittered_mask_soft_prob) + 255 * 0.6 * jittered_mask_soft_prob
-    axes[3, 3].imshow(overlay_jittered.astype(np.uint8))
+    overlay_shifted = np.array(image_down).copy()
+    overlay_shifted[:, :, 0] = overlay_shifted[:, :, 0] * (1 - 0.6 * shifted_mask_soft_prob) + 255 * 0.6 * shifted_mask_soft_prob
+    axes[3, 3].imshow(overlay_shifted.astype(np.uint8))
     axes[3, 3].set_title('Soft Mask Overlay')
     
     plt.suptitle(f'Boundary Misalignment Test - Epoch {epoch} (Noise: {noise_percentage*100:.1f}%, Shift: {noise_shift}px)', 
@@ -378,11 +422,11 @@ def main():
     # Boundary misalignment parameters
     NOISE_PERCENTAGE = 0.5  # Percentage of boundaries to shift (0.0-1.0), e.g., 0.2 = 20%
     NOISE_SHIFT = 1  # Number of pixels to shift boundaries (1 or 2)
-    SOFT_PROB = 0.8  # Soft probability for foreground class (background gets 1.0 - SOFT_PROB)
+    SOFT_PROB = 0.75  # Soft probability for foreground class (background gets 1.0 - SOFT_PROB)
     
     # Training parameters
-    NUM_EPOCHS = 500
-    LEARNING_RATE = 0.0001
+    NUM_EPOCHS = 1000
+    LEARNING_RATE = 0.0005
     BATCH_SIZE = 1
     
     # Synthetic image parameters
@@ -428,9 +472,6 @@ def main():
     )
     contours_noisy_x = torch.from_numpy(contours_noisy_x_np).float().to(device)
     contours_noisy_y = torch.from_numpy(contours_noisy_y_np).float().to(device)
-    
-    # Convert jittered mask to tensor for use in training
-    jittered_mask_tensor = torch.from_numpy(jittered_mask).long().to(device)  # [H_down, W_down]
     
     # Setup transforms
     transform = transforms.Compose([
@@ -494,22 +535,23 @@ def main():
         model_outputs = model(transformed_image)
         segmentations = model_outputs['seg']  # [B, C, H, W]
         
-        # Use jittered mask for unary potentials (instead of ground truth)
+        # Use shifted original mask for unary potentials (instead of jittered mask)
         B, C, H_seg, W_seg = segmentations.shape
         
-        # Resize jittered mask to match segmentation size if needed
-        jittered_mask_resized = jittered_mask_tensor.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H_down, W_down]
-        jittered_mask_resized = jittered_mask_resized.squeeze(0).long()  # [1, H_seg, W_seg]
+        # Shift the original mask up and left by 1 pixel
+        target_tensor = target.unsqueeze(0)  # [1, H_down, W_down] for batch dimension
+        shifted_mask = shift_mask(target_tensor[0], shift_up=5, shift_left=5)  # [H_down, W_down]
+        shifted_mask_resized = shifted_mask
         
-        # Convert to soft probabilities (jittered mask)
+        # Convert to soft probabilities (shifted mask)
         # Use soft probabilities: foreground class gets SOFT_PROB, background gets 1.0 - SOFT_PROB
         # For valid probability distribution: if mask==1 (foreground): [bg=1-SOFT_PROB, fg=SOFT_PROB]
         #                                     if mask==0 (background): [bg=SOFT_PROB, fg=1-SOFT_PROB]
         pseudolabel_probs = torch.zeros((B, 2, H_seg, W_seg), dtype=torch.float32, device=device)
         for b in range(B):
-            # Foreground pixels (jittered_mask == 1): [bg=1-SOFT_PROB, fg=SOFT_PROB]
-            # Background pixels (jittered_mask == 0): [bg=SOFT_PROB, fg=1-SOFT_PROB]
-            is_foreground = (jittered_mask_resized[b] == 1).float()
+            # Foreground pixels (shifted_mask == 1): [bg=1-SOFT_PROB, fg=SOFT_PROB]
+            # Background pixels (shifted_mask == 0): [bg=SOFT_PROB, fg=1-SOFT_PROB]
+            is_foreground = (shifted_mask_resized == 1).float()
             pseudolabel_probs[b, 0] = is_foreground * (1.0 - SOFT_PROB) + (1.0 - is_foreground) * SOFT_PROB  # background class
             pseudolabel_probs[b, 1] = is_foreground * SOFT_PROB + (1.0 - is_foreground) * (1.0 - SOFT_PROB)  # foreground class
         
@@ -550,14 +592,16 @@ def main():
                 ).squeeze(0)  # [C, H_orig, W_orig]
                 
                 # Create soft probability mask for visualization (foreground class probability)
-                jittered_mask_soft_prob = jittered_mask.astype(float) * SOFT_PROB + (1.0 - jittered_mask.astype(float)) * (1.0 - SOFT_PROB)
+                # Use shifted mask instead of jittered mask
+                shifted_mask_np = shift_mask(target.cpu().numpy(), shift_up=5, shift_left=5)
+                shifted_mask_soft_prob = shifted_mask_np.astype(float) * SOFT_PROB + (1.0 - shifted_mask_np.astype(float)) * (1.0 - SOFT_PROB)
                 
                 visualize_results(
                     image_orig, image_down, mask_down,
                     pred_down, pred_orig,
                     contours_gt_x_np, contours_gt_y_np,
                     contours_noisy_x_np, contours_noisy_y_np,
-                    jittered_mask, jittered_mask_soft_prob,
+                    shifted_mask_np, shifted_mask_soft_prob,
                     epoch + 1, output_dir,
                     NOISE_PERCENTAGE, NOISE_SHIFT, SOFT_PROB
                 )

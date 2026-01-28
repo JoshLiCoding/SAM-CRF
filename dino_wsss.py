@@ -19,7 +19,7 @@ from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
 from model.dino_txt_full_img import generate_pseudolabels_batch, build_text_embeddings, get_class_names_from_config
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
 from utils.loss import CollisionCrossEntropyLoss, PottsLoss
-from utils.metrics import update_miou
+from utils.metrics import update_miou, test_time_augmentation_inference
 from utils.sam import generate_sam_contours_batch, generate_fastsam_contours_batch, generate_gt_contours_batch, generate_color_diff_contours_batch
 from utils.vis import vis_train_sample_img, vis_val_sample_img, vis_train_loss, vis_val_loss
 import sys
@@ -65,6 +65,8 @@ VALIDATION_INTERVAL = config['training']['validation_interval']
 POTTS_TYPE = config['loss']['potts_type']
 CONTOUR_METHOD = config['loss']['contour_method']
 TRAIN_ONLY = config['training']['train_only']
+TTA_ENABLED = config['training']['test_time_augmentation']['enabled']
+TTA_SCALES = config['training']['test_time_augmentation']['scales']
 CLASS_NAMES = {0: "background", 1: "aeroplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "diningtable", 12: "dog", 13: "horse", 14: "motorbike", 15: "person", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "tv/monitor", 255: "ignore"}
 
 # Setup directories and paths
@@ -193,7 +195,9 @@ def main():
     
     optimizer = torch.optim.SGD(
         params=optimizer_params,
-        lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY
+        lr=LEARNING_RATE,
+        momentum=MOMENTUM,
+        weight_decay=WEIGHT_DECAY
     )
 
     model_checkpoint = config['paths']['model_checkpoint']
@@ -374,6 +378,8 @@ def main():
                 continue
             
             print(f"Running validation at epoch {epoch + 1}...")
+            if TTA_ENABLED:
+                print(f"Test-time augmentation enabled with scales: {TTA_SCALES}")
             model.eval()
             
             # initialize per-class intersection and union counters
@@ -384,9 +390,21 @@ def main():
                 for val_transformed_image, val_target in val_dataset:
                     val_transformed_image = val_transformed_image.to(device)
                     val_target = val_target.to(device)
+                    
+                    # Get target size for TTA
+                    target_size = val_target.shape[-2:]  # (H, W)
 
-                    val_output = model(val_transformed_image.unsqueeze(0))
-                    segmentation = val_output['seg']
+                    if TTA_ENABLED:
+                        # Use test-time augmentation
+                        segmentation = test_time_augmentation_inference(
+                            model, val_transformed_image, target_size, 
+                            scales=TTA_SCALES, device=device
+                        )
+                    else:
+                        # Standard inference
+                        val_output = model(val_transformed_image.unsqueeze(0))
+                        segmentation = val_output['seg']
+                    
                     update_miou(segmentation, val_target.unsqueeze(0), intersection_counts, union_counts, NUM_CLASSES, IGNORE_INDEX)
 
             ious = []
