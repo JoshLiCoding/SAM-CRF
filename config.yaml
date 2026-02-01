@@ -28,7 +28,7 @@ training:
 # Loss Parameters
 loss:
   potts_type: 'quadratic'
-  contour_method: 'fastsam'  # 'sam', 'fastsam', 'gt', 'color_diff'
+  contour_method: 'sam'  # 'sam', 'fastsam', 'gt', 'color_diff'
 
 # Dataset Parameters
 dataset:
@@ -41,14 +41,14 @@ dataset:
 
 # Directory Structure
 directories:
-  output: 'output_15_bicycle'
+  output: 'output_16_bicycle_from_fg_then_reg'
   checkpoints: 'checkpoints'
-  visualizations: 'vis_{num_epochs}epochs_t=0.05mm_fg_w=100_dl=3'
+  visualizations: 'vis_{num_epochs}epochs_t=0.05mm_w=mixed_new_x2_plane=1200_diningtable=0_dl=3_sam'
 
 # File Paths
 paths:
   model_checkpoint: 'output_10/checkpoints/10epochs_t=0.05mm_bicycle_fg_weighted_lr=0.001.pt'
-  model: 'output_15_bicycle/checkpoints/{num_epochs}epochs_t=0.05mm_fg_w=100_dl=3.pt'
+  model: 'output_16_bicycle_from_fg_then_reg/checkpoints/{num_epochs}epochs_t=0.05mm_w=mixed_new_x2_plane=1200_diningtable=0_dl=3_sam.pt'
   sam_checkpoint: 'sam_checkpoint/sam_vit_b_01ec64.pth'
 
 # Visualization Parameters
