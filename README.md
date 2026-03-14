@@ -2,7 +2,7 @@
 
 ## Overview
 
-SAM-CRF trains with a conditional random field (CRF)-based loss: the per-pixel **unary** term encourages predictions to be similar to dino.txt pseudo-labels, and the **pairwise** term regularizes predictions using SAM boundaries. A lightweight decoder is trained on top of a frozen DINOv3 backbone.
+SAM-CRF trains with a conditional random field (CRF)-based loss: the per-pixel **unary** term encourages predictions to be similar to dino.txt pseudo-labels, and the **pairwise** term regularizes predictions using SAM boundaries. In terms of the architecture, SAM-CRF adds a lightweight decoder that runs parallel to the dino.txt vision head, both on top of a frozen DINOv3 backbone.
 
 ## Method
 
