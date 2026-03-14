@@ -16,11 +16,18 @@ from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 from model.dino import DinoWSSS
 from model.deeplab import deeplabv3_resnet101, deeplabv3plus_resnet101
+from model.scheduler import PolyLR
 from model.dino_txt_full_img import generate_pseudolabels_batch, build_text_embeddings, get_class_names_from_config
 from utils.dataset import VOCSegmentation, COCOSegmentation, CustomSegmentationTrain, CustomSegmentationVal
-from utils.loss import CollisionCrossEntropyLoss, PottsLoss
-from utils.metrics import update_miou, test_time_augmentation_inference
-from utils.sam import generate_sam_contours_batch, generate_fastsam_contours_batch, generate_gt_contours_batch, generate_color_diff_contours_batch
+from utils.loss import CollisionCrossEntropyLoss, PottsLoss, KLDivergenceLoss, CrossEntropyLoss, ReverseCrossEntropyLoss, KLEntropyLoss
+from utils.metrics import update_miou
+from utils.sam import (
+    generate_sam_contours_batch,
+    generate_fastsam_contours_batch,
+    generate_slic_contours_batch,
+    generate_gt_contours_batch,
+    generate_color_diff_contours_batch,
+)
 from utils.vis import vis_train_sample_img, vis_val_sample_img, vis_train_loss, vis_val_loss
 import sys
 DINOV3_LOCATION = '/u501/j234li/wsss/model/dinov3'
@@ -65,9 +72,12 @@ VALIDATION_INTERVAL = config['training']['validation_interval']
 POTTS_TYPE = config['loss']['potts_type']
 CONTOUR_METHOD = config['loss']['contour_method']
 TRAIN_ONLY = config['training']['train_only']
-TTA_ENABLED = config['training']['test_time_augmentation']['enabled']
-TTA_SCALES = config['training']['test_time_augmentation']['scales']
-CLASS_NAMES = {0: "background", 1: "aeroplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "diningtable", 12: "dog", 13: "horse", 14: "motorbike", 15: "person", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "tv/monitor", 255: "ignore"}
+
+VOC_CLASS_NAMES = {0: "background", 1: "aeroplane", 2: "bicycle", 3: "bird", 4: "boat", 5: "bottle", 6: "bus", 7: "car", 8: "cat", 9: "chair", 10: "cow", 11: "diningtable", 12: "dog", 13: "horse", 14: "motorbike", 15: "person", 16: "potted plant", 17: "sheep", 18: "sofa", 19: "train", 20: "tv/monitor", 255: "ignore"}
+
+COCO_CLASS_NAMES = {0: "background", 1: "person", 2: "bicycle", 3: "car", 4: "motorcycle", 5: "airplane", 6: "bus", 7: "train", 8: "truck", 9: "boat", 10: "traffic light", 11: "fire hydrant", 12: "stop sign", 13: "parking meter", 14: "bench", 15: "bird", 16: "cat", 17: "dog", 18: "horse", 19: "sheep", 20: "cow", 21: "elephant", 22: "bear", 23: "zebra", 24: "giraffe", 25: "backpack", 26: "umbrella", 27: "handbag", 28: "tie", 29: "suitcase", 30: "frisbee", 31: "skis", 32: "snowboard", 33: "sports ball", 34: "kite", 35: "baseball bat", 36: "baseball glove", 37: "skateboard", 38: "surfboard", 39: "tennis racket", 40: "bottle", 41: "wine glass", 42: "cup", 43: "fork", 44: "knife", 45: "spoon", 46: "bowl", 47: "banana", 48: "apple", 49: "sandwich", 50: "orange", 51: "broccoli", 52: "carrot", 53: "hot dog", 54: "pizza", 55: "donut", 56: "cake", 57: "chair", 58: "couch", 59: "potted plant", 60: "bed", 61: "dining table", 62: "toilet", 63: "tv", 64: "laptop", 65: "mouse", 66: "remote", 67: "keyboard", 68: "cell phone", 69: "microwave", 70: "oven", 71: "toaster", 72: "sink", 73: "refrigerator", 74: "book", 75: "clock", 76: "vase", 77: "scissors", 78: "teddy bear", 79: "hair drier", 80: "toothbrush", 255: "ignore"}
+
+CLASS_NAMES = VOC_CLASS_NAMES if config['dataset']['dataset_name'] == 'voc' else COCO_CLASS_NAMES
 
 # Setup directories and paths
 DIRS = {
@@ -182,7 +192,7 @@ def main():
     ).to(device)
     model.backbone.eval()
     model.dinotxt_head.eval()
-    
+
     optimizer_params = [
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
@@ -199,12 +209,14 @@ def main():
         momentum=MOMENTUM,
         weight_decay=WEIGHT_DECAY
     )
+    max_iters = NUM_EPOCHS * len(train_loader)
+    # scheduler = PolyLR(optimizer, max_iters=max_iters)
 
     model_checkpoint = config['paths']['model_checkpoint']
     if os.path.exists(model_checkpoint):
         print(f"Loading checkpoint from {model_checkpoint}...")
         checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         print(f"Resuming training")
     else:
         print("No checkpoint found, starting training from epoch 0.")
@@ -259,22 +271,30 @@ def main():
                 pseudolabel_tensor = F.interpolate(pseudolabel_tensor, size=(H_seg, W_seg), mode='bilinear', align_corners=False)
                 pseudolabel_tensor = pseudolabel_tensor[0]  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg] (C, H, W)
                 
-                # argmax
-                # num_classes_in_pseudolabel = pseudolabel_tensor.shape[0]
-                # argmax_indices = torch.argmax(pseudolabel_tensor, dim=0)  # [H_seg, W_seg]
-                # pseudolabel_probs_b = F.one_hot(argmax_indices, num_classes=num_classes_in_pseudolabel).float()  # [H_seg, W_seg, num_classes]
-                # pseudolabel_probs_b = pseudolabel_probs_b.permute(2, 0, 1)  # [num_classes, H_seg, W_seg]
-                
                 # Softmax with temperature
                 t = 0.05
                 pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)
-                
+
                 # Min-max normalize channel-wise, then renormalize to probability simplex
                 min_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).min(dim=1, keepdim=True)[0].unsqueeze(-1)
                 max_vals = pseudolabel_probs_b.view(pseudolabel_probs_b.shape[0], -1).max(dim=1, keepdim=True)[0].unsqueeze(-1)
                 pseudolabel_probs_b = (pseudolabel_probs_b - min_vals) / (max_vals - min_vals + 1e-8)
 
                 pseudolabel_probs_b = pseudolabel_probs_b / (pseudolabel_probs_b.sum(dim=0, keepdim=True) + 1e-8)
+                
+                # [TEST] Dense CRF at 4x downsampled resolution (112x112) — remove this block after testing
+                # import pydensecrf.densecrf as dcrf
+                # from pydensecrf.utils import unary_from_softmax
+                # from utils.dataset import MEAN, STD
+                # probs_np = pseudolabel_probs_b.cpu().numpy().astype(np.float32)
+                # Cc, Hc, Wc = probs_np.shape
+                # img_112 = F.interpolate(transformed_images[b : b + 1], size=(Hc, Wc), mode='bilinear', align_corners=False)[0].cpu()
+                # img_uint8 = np.ascontiguousarray((img_112.permute(1, 2, 0).numpy() * np.array(STD) + np.array(MEAN)).clip(0, 1) * 255).astype(np.uint8)
+                # d = dcrf.DenseCRF2D(Wc, Hc, Cc)
+                # d.setUnaryEnergy(unary_from_softmax(np.ascontiguousarray(probs_np)))
+                # d.addPairwiseBilateral(sxy=20, srgb=13, rgbim=img_uint8, compat=10)
+                # d.addPairwiseGaussian(sxy=1, compat=3)
+                # pseudolabel_probs_b = torch.from_numpy(np.array(d.inference(10)).reshape(Cc, Hc, Wc)).float().to(device)
                 
                 # Map to full class space [NUM_CLASSES, H_seg, W_seg]
                 if len(class_indices) == 0:
@@ -297,32 +317,27 @@ def main():
                 # Resize to segmentation size
                 images_denorm_batch = F.interpolate(images_denorm_batch, size=(segmentations.shape[2], segmentations.shape[3]), mode='bilinear', align_corners=False)
                 sam_contours_x_batch, sam_contours_y_batch = generate_color_diff_contours_batch(images_denorm_batch, device)
-            elif CONTOUR_METHOD == 'sam':
-                # Convert images to PIL format
-                images_pil = []
-                for img in transformed_images:
-                    img_denorm = train_dataset.denormalize(img.clone())
-                    img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-                    images_pil.append(Image.fromarray((img_np * 255).astype(np.uint8)))
-                
-                # Use SAM automatic mask generator to generate contours
-                sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
-                    sam_mask_generator, images_pil, device
-                )
-                sam_contours_x_batch = sam_contours_x_batch.to(device)
-                sam_contours_y_batch = sam_contours_y_batch.to(device)
-            elif CONTOUR_METHOD == 'fastsam':
-                # Convert images to PIL format
-                images_pil = []
-                for img in transformed_images:
-                    img_denorm = train_dataset.denormalize(img.clone())
-                    img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-                    images_pil.append(Image.fromarray((img_np * 255).astype(np.uint8)))
-                
-                # Use FastSAM to generate contours
-                sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
-                    fastsam_model, images_pil, device
-                )
+            elif CONTOUR_METHOD in ('sam', 'fastsam', 'slic'):
+                def _to_pil(img_t):
+                    img_denorm = train_dataset.denormalize(img_t.clone())
+                    img_np = (img_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                    return Image.fromarray(img_np)
+
+                images_pil = [_to_pil(img) for img in transformed_images]
+
+                if CONTOUR_METHOD == 'sam':
+                    sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
+                        sam_mask_generator, images_pil, device
+                    )
+                elif CONTOUR_METHOD == 'fastsam':
+                    sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
+                        fastsam_model, images_pil, device
+                    )
+                else:  # slic
+                    sam_contours_x_batch, sam_contours_y_batch = generate_slic_contours_batch(
+                        images_pil, device
+                    )
+
                 sam_contours_x_batch = sam_contours_x_batch.to(device)
                 sam_contours_y_batch = sam_contours_y_batch.to(device)
             
@@ -336,6 +351,7 @@ def main():
 
             total_loss.backward()
             optimizer.step()
+            # scheduler.step()
 
             running_total_loss += total_loss.item()
             running_unary_loss += unary_loss.item()
@@ -378,8 +394,6 @@ def main():
                 continue
             
             print(f"Running validation at epoch {epoch + 1}...")
-            if TTA_ENABLED:
-                print(f"Test-time augmentation enabled with scales: {TTA_SCALES}")
             model.eval()
             
             # initialize per-class intersection and union counters
@@ -391,19 +405,8 @@ def main():
                     val_transformed_image = val_transformed_image.to(device)
                     val_target = val_target.to(device)
                     
-                    # Get target size for TTA
-                    target_size = val_target.shape[-2:]  # (H, W)
-
-                    if TTA_ENABLED:
-                        # Use test-time augmentation
-                        segmentation = test_time_augmentation_inference(
-                            model, val_transformed_image, target_size, 
-                            scales=TTA_SCALES, device=device
-                        )
-                    else:
-                        # Standard inference
-                        val_output = model(val_transformed_image.unsqueeze(0))
-                        segmentation = val_output['seg']
+                    val_output = model(val_transformed_image.unsqueeze(0))
+                    segmentation = val_output['seg']
                     
                     update_miou(segmentation, val_target.unsqueeze(0), intersection_counts, union_counts, NUM_CLASSES, IGNORE_INDEX)
 
@@ -451,7 +454,7 @@ def main():
     
     if os.path.exists(PATHS['model']):
         best_checkpoint = torch.load(PATHS['model'], map_location=device, weights_only=False)
-        model.load_state_dict(best_checkpoint['model_state_dict'])
+        model.load_state_dict(best_checkpoint['model_state_dict'], strict=False)
         print(f"Best model loaded successfully! Final validation mIoU: {best_miou:.4f}")
     
     vis_output_dir = os.path.join(DIRS['output'], DIRS['visualizations'])

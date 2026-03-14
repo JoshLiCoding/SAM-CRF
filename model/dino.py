@@ -209,7 +209,8 @@ class DinoWSSS(nn.Module):
         tokens = torch.cat([class_token.unsqueeze(1), register_tokens, patch_tokens], dim=1)
         for block in self.transformer_blocks:
             tokens = block(tokens)
-        tokens = self.ln(tokens)
+        if self.num_transformer_blocks > 0:
+            tokens = self.ln(tokens)
         
         # Extract patch tokens for spatial processing
         seg_patch_tokens = tokens[:, self.num_register_tokens + 1:] # (B, P, D)

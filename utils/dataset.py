@@ -1,7 +1,6 @@
 import os
 import sys
 import tarfile
-import collections
 import shutil
 import numpy as np
 import torch
@@ -22,7 +21,7 @@ DATASET_YEAR_DICT = {
         'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar',
         'filename': 'VOCtrainval_11-May-2012.tar',
         'md5': '6cd6e144f989b92b3379bac3b3de84fd',
-        'base_dir': 'VOCdevkit/VOC2012'
+        'base_dir': 'VOCdevkit_old/VOC2012'
     }
 }
 RESIZE_SIZE = 448
@@ -100,11 +99,6 @@ class VOCSegmentation(data.Dataset):
             splits_dir = os.path.join(voc_root, 'ImageSets/Segmentation')
             split_f = os.path.join(splits_dir, image_set.rstrip('\n') + '.txt')
 
-        if not os.path.exists(split_f):
-            raise ValueError(
-                'Wrong image_set entered! Please use image_set="train" '
-                'or image_set="trainval" or image_set="val"')
-
         with open(os.path.join(split_f), "r") as f:
             file_names = [x.strip() for x in f.readlines()]
         
@@ -124,6 +118,14 @@ class VOCSegmentation(data.Dataset):
         if self.n_images == -1:
             return len(self.images)
         return min(self.n_images, len(self.images))
+
+    def get_image_class_ids(self, index):
+        """Return unique foreground class indices (1..20) present in this image. No image load."""
+        mask_path = self.masks[index]
+        target = np.array(Image.open(mask_path), dtype=np.int64)
+        class_ids = np.unique(target)
+        class_ids = class_ids[(class_ids != 0) & (class_ids != 255)]
+        return class_ids
 
     @classmethod
     def decode_target(cls, mask):
@@ -217,6 +219,21 @@ class COCOSegmentation(data.Dataset):
         # Limit number of images if specified
         if self.n_images > 0:
             self.ids = self.ids[:n_images]
+
+    def get_image_class_ids(self, index):
+        """Return unique foreground class indices (1..80) present in this image. Uses COCO API only (no image/mask load)."""
+        img_id = self.ids[index]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        class_ids = []
+        for ann in anns:
+            if 'segmentation' not in ann or not ann['segmentation']:
+                continue
+            cat_id = ann['category_id']
+            class_id = self.cat_id_to_class_id.get(cat_id, 0)
+            if class_id != 0:
+                class_ids.append(class_id)
+        return np.unique(class_ids).astype(np.int64) if class_ids else np.array([], dtype=np.int64)
     
     def __getitem__(self, index):
         img_id = self.ids[index]
@@ -262,6 +279,7 @@ class COCOSegmentation(data.Dataset):
     def decode_target(cls, mask):
         """Decode semantic mask to RGB image"""
         return cls.cmap[mask]
+
 
 class CustomSegmentationTrain(Dataset):
     def __init__(self, dataset):
@@ -315,5 +333,23 @@ class CustomSegmentationVal(Dataset):
     def __getitem__(self, idx): 
         image, target = self.dataset[idx]
         transformed_image = val_transform(image)
+        target = torch.from_numpy(np.array(target))
+        return transformed_image, target
+
+
+val_transform_tta = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=MEAN, std=STD),
+])
+class CustomSegmentationValTTA(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def __getitem__(self, idx): 
+        image, target = self.dataset[idx]
+        transformed_image = val_transform_tta(image)
         target = torch.from_numpy(np.array(target))
         return transformed_image, target

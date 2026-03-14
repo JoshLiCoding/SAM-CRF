@@ -8,7 +8,13 @@ from PIL import Image
 from utils.loss import calculate_pairwise_affinity
 from utils.dataset import cmap
 from model.dino_txt_full_img import generate_pseudolabels_batch
-from utils.sam import generate_sam_contours_batch, generate_fastsam_contours_batch, generate_gt_contours_batch, generate_color_diff_contours_batch
+from utils.sam import (
+    generate_sam_contours_batch,
+    generate_fastsam_contours_batch,
+    generate_slic_contours_batch,
+    generate_gt_contours_batch,
+    generate_color_diff_contours_batch,
+)
 
 def visualize_soft_probabilities(logits, softmax=True):
     if softmax:
@@ -85,12 +91,6 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, ou
             pseudolabel_tensor = F.interpolate(pseudolabel_tensor, size=(H_seg, W_seg), mode='bilinear', align_corners=False)
             pseudolabel_tensor = pseudolabel_tensor[0]  # [num_fg+1, H_seg, W_seg] or [1, H_seg, W_seg] (C, H, W)
             
-            # argmax
-            # num_classes_in_pseudolabel = pseudolabel_tensor.shape[0]
-            # argmax_indices = torch.argmax(pseudolabel_tensor, dim=0)  # [H_seg, W_seg]
-            # pseudolabel_probs_b = F.one_hot(argmax_indices, num_classes=num_classes_in_pseudolabel).float()  # [H_seg, W_seg, num_classes]
-            # pseudolabel_probs_b = pseudolabel_probs_b.permute(2, 0, 1)  # [num_classes, H_seg, W_seg]
-            
             # Softmax with temperature
             t = 0.05
             pseudolabel_probs_b = torch.softmax(pseudolabel_tensor / t, dim=0)
@@ -125,26 +125,27 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, ou
             img_denorm_batch = img_denorm.unsqueeze(0)  # [1, C, H_orig, W_orig]
             img_denorm_batch = F.interpolate(img_denorm_batch, size=(H_seg, W_seg), mode='bilinear', align_corners=False).to(device)
             sam_contours_x_batch, sam_contours_y_batch = generate_color_diff_contours_batch(img_denorm_batch, device)
-        elif contour_method == 'sam':
+        elif contour_method in ('sam', 'fastsam', 'slic'):
             img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
-            img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-            images_pil = [Image.fromarray((img_np * 255).astype(np.uint8))]
-            
-            # Use SAM automatic mask generator to generate contours
-            sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
-                sam_mask_generator, images_pil, device
-            )
-        elif contour_method == 'fastsam':
-            img_denorm = train_dataset.denormalize(transformed_img_batch[0].clone())
-            img_np = img_denorm.permute(1, 2, 0).cpu().numpy()
-            images_pil = [Image.fromarray((img_np * 255).astype(np.uint8))]
-            
-            # Use FastSAM to generate contours
-            sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
-                fastsam_model, images_pil, device
-            )
+            img_np = (img_denorm.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            images_pil = [Image.fromarray(img_np)]
+
+            if contour_method == 'sam':
+                sam_contours_x_batch, sam_contours_y_batch = generate_sam_contours_batch(
+                    sam_mask_generator, images_pil, device
+                )
+            elif contour_method == 'fastsam':
+                sam_contours_x_batch, sam_contours_y_batch = generate_fastsam_contours_batch(
+                    fastsam_model, images_pil, device
+                )
+            else:  # slic
+                sam_contours_x_batch, sam_contours_y_batch = generate_slic_contours_batch(
+                    images_pil, device
+                )
         else:
-            raise ValueError(f"Unknown contour_method: {contour_method}. Must be one of: 'sam', 'fastsam', 'gt', 'color_diff'")
+            raise ValueError(
+                f"Unknown contour_method: {contour_method}. Must be one of: 'sam', 'fastsam', 'slic', 'gt', 'color_diff'"
+            )
         
         sam_contours_x = sam_contours_x_batch[0].cpu().numpy()  # [H, W-1]
         sam_contours_y = sam_contours_y_batch[0].cpu().numpy()  # [H-1, W]
@@ -166,7 +167,7 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, ou
     output_vis = original_train_dataset.decode_target(output_vis)
     
     # Create visualization
-    fig, axes = plt.subplots(7, 2, figsize=(8, 32))
+    fig, axes = plt.subplots(8, 2, figsize=(8, 32))
     
     axes[0, 0].imshow(img)
     axes[0, 0].set_title('Original Image')
@@ -224,7 +225,19 @@ def vis_train_sample_img(original_train_dataset, train_dataset, model, index, ou
     axes[6, 1].imshow(expanded_sam_contours_y, alpha=0.5, cmap='gray')
     axes[6, 1].imshow(soft_output, alpha=0.5)
     axes[6, 1].set_title(f'Soft Model Output & {contour_title} (vertical)')
-    
+
+    inverted_contours_or = np.minimum(1.0 - expanded_sam_contours_x, 1.0 - expanded_sam_contours_y)
+    axes[7, 0].imshow(inverted_contours_or, cmap='gray', vmin=0, vmax=1)
+    axes[7, 0].set_title(f'Inverted {contour_title} (H|V OR)')
+
+    expanded_w_x = np.zeros((H, W), dtype=np.float32)
+    expanded_w_x[:, :w_x_vis.shape[1]] = w_x_vis
+    expanded_w_y = np.zeros((H, W), dtype=np.float32)
+    expanded_w_y[:w_y_vis.shape[0], :] = w_y_vis
+    distance_field_or = np.minimum(expanded_w_x, expanded_w_y)
+    axes[7, 1].imshow(distance_field_or, cmap='gray', vmin=0, vmax=1)
+    axes[7, 1].set_title(f'{contour_title} Distance Field (H|V OR)')
+
     plt.tight_layout()
     save_path = os.path.join(output_dir, f'visualization_sample_{index}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -258,8 +271,9 @@ def vis_val_sample_img(original_val_dataset, val_dataset, model, index, output_d
     output_resized_vis = output_resized.argmax(0).numpy().astype(np.uint8)
     output_resized_vis = Image.fromarray(output_resized_vis)
     output_resized_vis = original_val_dataset.decode_target(output_resized_vis)
+    soft_output_resized = visualize_soft_probabilities(output_resized, softmax=True)
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     axes[0, 0].imshow(img)
     axes[0, 0].set_title('Original Image')
 
@@ -275,7 +289,11 @@ def vis_val_sample_img(original_val_dataset, val_dataset, model, index, output_d
     axes[1, 2].imshow(output_resized_vis)
     axes[1, 2].set_title('Model Output (Resized)')
 
+    axes[1, 3].imshow(soft_output_resized)
+    axes[1, 3].set_title('Soft Model Output (Resized)')
+
     axes[0, 1].axis('off')
+    axes[0, 3].axis('off')
 
     plt.tight_layout()
     save_path = os.path.join(output_dir, f'val_visualization_sample_{index}.png')

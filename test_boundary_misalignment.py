@@ -1,42 +1,27 @@
 """
 Test script to evaluate model performance on boundary misalignment.
 
-This script:
-1. Creates a synthetic square image with 2 colors (red square on green background)
-2. Downsamples the image by 4x (512x512 -> 128x128)
-3. Generates ground truth contours from the downsampled mask
-4. Adds noise to boundaries by shifting a percentage of contour pixels
-5. Trains the model using:
-   - Ground truth labels (directly from mask)
-   - Noisy boundaries (shifted contours)
-6. Visualizes results at both 4x downsampled and original resolution
-   to see the effect of misaligned boundaries on model convergence
-
-Hyperparameters (configurable in main()):
-- NOISE_PERCENTAGE: Percentage of boundaries to shift (0.0-1.0)
-- NOISE_SHIFT: Number of pixels to shift boundaries (1 or 2)
-- NUM_EPOCHS: Number of training epochs
-- LEARNING_RATE: Learning rate for training
+Creates a synthetic square image, downsamples 4x, and trains with:
+- Two unary losses from two differently shifted masks (configurable shifts)
+Visualization: original image at full resolution; other panels (GT, pred, unary 1, unary 2) at 4x down.
 """
 
 import os
 import sys
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from tqdm import tqdm
-import yaml
 
 # Add paths
 DINOV3_LOCATION = '/u501/j234li/wsss/model/dinov3'
 sys.path.append(DINOV3_LOCATION)
 
 from model.dino import DinoWSSS
-from utils.loss import CollisionCrossEntropyLoss, PottsLoss
+from utils.loss import CollisionCrossEntropyLoss
 from torchvision import transforms
 
 
@@ -102,120 +87,16 @@ def downsample_image_and_mask(image, mask, factor=4):
     return image_down, mask_down
 
 
-def generate_jittered_contours(mask, noise_percentage=0.1, noise_shift=1, device=None):
+def shift_mask(mask, shift_down=1, shift_right=1):
     """
-    Generate jittered contours by adding pixels around the mask boundary within the shift range.
-    These contours will have 0 pairwise loss for the modified mask, but won't match the original boundaries.
-    
-    The jitter is created by:
-    1. Finding all pixels within noise_shift distance from the mask boundary (currently 0)
-    2. Randomly selecting noise_percentage of those pixels
-    3. Setting them to 1 to expand the mask
-    4. Generating contours from the modified mask
-    
-    Args:
-        mask: numpy array [H, W] with class indices (0=background, 1=square)
-        noise_percentage: Percentage of boundary pixels to add (0-1). Higher = more jitter.
-        noise_shift: Maximum distance from boundary to consider (1 or 2 pixels)
-        device: torch device (optional, for consistency with other functions)
-    
-    Returns:
-        jittered_contours_x: numpy array [H, W-1]
-        jittered_contours_y: numpy array [H-1, W]
-        jittered_mask: numpy array [H, W] - the modified mask used to generate contours
-    """
-    # Create a copy of the mask
-    jittered_mask = mask.copy().astype(np.uint8)
-    H, W = jittered_mask.shape
-    
-    # Find all pixels that are within noise_shift distance from the mask boundary
-    # These are pixels that are currently 0 (background) but adjacent to pixels that are 1 (square)
-    
-    # Create a list of candidate pixels (background pixels near the boundary)
-    candidate_pixels = []
-    
-    # Check all pixels in the image
-    for h in range(H):
-        for w in range(W):
-            # Only consider background pixels (value 0)
-            if jittered_mask[h, w] == 0:
-                # Check if this pixel is within noise_shift distance from a square pixel
-                is_near_boundary = False
-                
-                # Check neighbors within noise_shift distance
-                for dh in range(-noise_shift, noise_shift + 1):
-                    for dw in range(-noise_shift, noise_shift + 1):
-                        # Skip the pixel itself
-                        if dh == 0 and dw == 0:
-                            continue
-                        
-                        # Check Manhattan distance (L1) is within noise_shift
-                        if abs(dh) + abs(dw) <= noise_shift:
-                            nh, nw = h + dh, w + dw
-                            # Check if neighbor is within bounds and is part of the square
-                            if 0 <= nh < H and 0 <= nw < W and jittered_mask[nh, nw] == 1:
-                                is_near_boundary = True
-                                break
-                    
-                    if is_near_boundary:
-                        break
-                
-                if is_near_boundary:
-                    candidate_pixels.append((h, w))
-    
-    # Randomly select noise_percentage of candidate pixels to add to the mask
-    if len(candidate_pixels) > 0:
-        if noise_percentage > 0.0:
-            num_to_add = max(1, int(len(candidate_pixels) * noise_percentage))
-            selected_pixels = np.random.choice(len(candidate_pixels), size=num_to_add, replace=False)
-            
-            # Set selected pixels to 1
-            for idx in selected_pixels:
-                h, w = candidate_pixels[idx]
-                jittered_mask[h, w] = 1
-    
-    # Generate contours from the jittered mask
-    # These contours will be consistent with the jittered_mask (0 pairwise loss for that mask)
-    # because they are the exact boundaries of that mask
-    jittered_contours_x = (jittered_mask[:, :-1] != jittered_mask[:, 1:]).astype(np.float32)  # [H, W-1]
-    jittered_contours_y = (jittered_mask[:-1, :] != jittered_mask[1:, :]).astype(np.float32)  # [H-1, W]
-    
-    return jittered_contours_x, jittered_contours_y, jittered_mask
+    Shift a mask down and right by specified amounts.
+    Negative values shift the opposite way (up/left).
 
-
-def get_ground_truth_contours(mask, device):
-    """
-    Get ground truth contours from mask without any downsampling.
-    
-    Args:
-        mask: numpy array [H, W] with class indices
-        device: torch device
-    
-    Returns:
-        contours_x: torch.Tensor [H, W-1]
-        contours_y: torch.Tensor [H-1, W]
-    """
-    # Detect horizontal edges (contours_x): compare each pixel with its right neighbor
-    contours_x = (mask[:, :-1] != mask[:, 1:]).astype(np.float32)  # [H, W-1]
-    
-    # Detect vertical edges (contours_y): compare each pixel with its bottom neighbor
-    contours_y = (mask[:-1, :] != mask[1:, :]).astype(np.float32)  # [H-1, W]
-    
-    contours_x_tensor = torch.from_numpy(contours_x).to(device)  # [H, W-1]
-    contours_y_tensor = torch.from_numpy(contours_y).to(device)  # [H-1, W]
-    
-    return contours_x_tensor, contours_y_tensor
-
-
-def shift_mask(mask, shift_up=1, shift_left=1):
-    """
-    Shift a mask up and left by specified amounts.
-    
     Args:
         mask: numpy array [H, W] or torch.Tensor [H, W] with class indices
-        shift_up: Number of pixels to shift up (positive = up)
-        shift_left: Number of pixels to shift left (positive = left)
-    
+        shift_down: Number of pixels to shift down (positive = down, negative = up)
+        shift_right: Number of pixels to shift right (positive = right, negative = left)
+
     Returns:
         shifted_mask: Same type as input, shifted mask [H, W]
     """
@@ -224,27 +105,27 @@ def shift_mask(mask, shift_up=1, shift_left=1):
         mask_np = mask.cpu().numpy()
     else:
         mask_np = mask.copy()
-    
+
     H, W = mask_np.shape
     shifted_mask = np.zeros_like(mask_np)
-    
-    # Shift up and left: new position = old position - shift
-    # For up: row decreases, so we copy from row+shift_up to row
-    # For left: col decreases, so we copy from col+shift_left to col
-    new_h_start = shift_up
-    new_w_start = shift_left
-    new_h_end = H
-    new_w_end = W
-    
-    old_h_start = 0
-    old_w_start = 0
-    old_h_end = H - shift_up
-    old_w_end = W - shift_left
-    
-    # Only copy if there's valid overlap
+
+    # Positive: content moves down/right. Negative: content moves up/left.
+    if shift_down >= 0 and shift_right >= 0:
+        # Shift down and right: copy from top-left to lower-right
+        new_h_start, new_w_start = shift_down, shift_right
+        new_h_end, new_w_end = H, W
+        old_h_start, old_w_start = 0, 0
+        old_h_end, old_w_end = H - shift_down, W - shift_right
+    elif shift_down <= 0 and shift_right <= 0:
+        # Shift up and left: copy from lower-right to top-left
+        new_h_start, new_w_start = 0, 0
+        new_h_end, new_w_end = H + shift_down, W + shift_right
+        old_h_start, old_w_start = -shift_down, -shift_right
+        old_h_end, old_w_end = H, W
+
     if new_h_end > new_h_start and new_w_end > new_w_start and old_h_end > old_h_start and old_w_end > old_w_start:
         shifted_mask[new_h_start:new_h_end, new_w_start:new_w_end] = mask_np[old_h_start:old_h_end, old_w_start:old_w_end]
-    
+
     if is_tensor:
         return torch.from_numpy(shifted_mask).to(mask.device).long()
     else:
@@ -273,354 +154,213 @@ def create_synthetic_dataset(image, mask, transform):
     return transformed_image, target
 
 
-def visualize_results(image_orig, image_down, mask_gt, predictions_down, predictions_orig,
-                     contours_gt_x, contours_gt_y, contours_noisy_x, contours_noisy_y,
-                     shifted_mask, shifted_mask_soft_prob, epoch, output_dir, noise_percentage, noise_shift, soft_prob):
-    """
-    Visualize training results at different resolutions.
-    
-    Args:
-        image_orig: PIL Image (original resolution)
-        image_down: PIL Image (downsampled)
-        mask_gt: numpy array [H_down, W_down] ground truth mask
-        predictions_down: torch.Tensor [C, H_down, W_down] model predictions at downsampled resolution
-        predictions_orig: torch.Tensor [C, H_orig, W_orig] model predictions at original resolution
-        contours_gt_x, contours_gt_y: Ground truth contours
-        contours_noisy_x, contours_noisy_y: Noisy contours used for training
-        shifted_mask: numpy array [H_down, W_down] shifted mask used to generate pseudolabel probs
-        shifted_mask_soft_prob: numpy array [H_down, W_down] soft probability mask (foreground class probability)
-        epoch: Current epoch
-        output_dir: Directory to save visualizations
-        noise_percentage: Percentage of noisy boundaries
-        noise_shift: Shift amount in pixels
-        soft_prob: Soft probability value for foreground class
-    """
+def compute_miou(pred, gt, num_classes=2):
+    """mIoU between predicted and ground truth masks. pred, gt: [H,W] int with values 0..num_classes-1."""
+    ious = []
+    for c in range(num_classes):
+        pred_c = (pred == c)
+        gt_c = (gt == c)
+        inter = np.logical_and(pred_c, gt_c).sum()
+        union = np.logical_or(pred_c, gt_c).sum()
+        ious.append(inter / union if union > 0 else float('nan'))
+    valid = [x for x in ious if not np.isnan(x)]
+    return np.mean(valid) if valid else float('nan')
+
+
+def visualize_results(image_orig, mask_gt, pred_down, mask_unary_1, mask_unary_2,
+                     epoch, output_dir, shift_unary_1, shift_unary_2):
+    """Original image at full resolution; other panels at 4x down. Shows both unary masks."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Convert predictions to numpy and get soft probabilities
-    if isinstance(predictions_down, torch.Tensor):
-        pred_down_np = torch.softmax(predictions_down, dim=0).cpu().numpy()  # [C, H, W]
-        pred_down_prob_square = pred_down_np[1]  # Probability of square class [H, W]
-    
-    if isinstance(predictions_orig, torch.Tensor):
-        pred_orig_np = torch.softmax(predictions_orig, dim=0).cpu().numpy()  # [C, H, W]
-        pred_orig_prob_square = pred_orig_np[1]  # Probability of square class [H, W]
-    
-    # Convert contours to numpy if needed
-    if isinstance(contours_gt_x, torch.Tensor):
-        contours_gt_x = contours_gt_x.cpu().numpy()
-    if isinstance(contours_gt_y, torch.Tensor):
-        contours_gt_y = contours_gt_y.cpu().numpy()
-    if isinstance(contours_noisy_x, torch.Tensor):
-        contours_noisy_x = contours_noisy_x.cpu().numpy()
-    if isinstance(contours_noisy_y, torch.Tensor):
-        contours_noisy_y = contours_noisy_y.cpu().numpy()
-    
-    # Create figure with subplots (4 rows x 4 columns)
-    fig, axes = plt.subplots(4, 4, figsize=(20, 20))
-    
-    # Row 1: Original resolution
-    axes[0, 0].imshow(image_orig)
-    axes[0, 0].set_title('Original Image')
-    
-    # Upsample ground truth mask to original resolution
-    mask_gt_orig = F.interpolate(
-        torch.from_numpy(mask_gt).unsqueeze(0).unsqueeze(0).float(),
-        size=(image_orig.size[1], image_orig.size[0]),
-        mode='nearest'
-    ).squeeze().numpy()
-    axes[0, 1].imshow(mask_gt_orig, cmap='gray')
-    axes[0, 1].set_title('GT Mask (upsampled)')
-    
-    # Resize probability to match original image size if needed
-    H_orig, W_orig = image_orig.size[1], image_orig.size[0]
-    pred_orig_prob_square_resized = pred_orig_prob_square
-    
-    # Show soft probability as grayscale
-    axes[0, 2].imshow(pred_orig_prob_square_resized, cmap='gray', vmin=0, vmax=1)
-    axes[0, 2].set_title(f'Soft Prediction (Original, Epoch {epoch})')
-    
-    # Blend soft prediction with image
-    overlay_orig = np.array(image_orig).copy().astype(float)
-    # Blend red channel with probability (red square class)
-    overlay_orig[:, :, 0] = overlay_orig[:, :, 0] * (1 - 0.6 * pred_orig_prob_square_resized) + 255 * 0.6 * pred_orig_prob_square_resized
-    axes[0, 3].imshow(overlay_orig.astype(np.uint8))
-    axes[0, 3].set_title('Soft Overlay (Original)')
-    
-    # Row 2: Downsampled resolution
-    axes[1, 0].imshow(image_down)
-    axes[1, 0].set_title('Downsampled Image (4x)')
-    
-    axes[1, 1].imshow(mask_gt, cmap='gray')
-    axes[1, 1].set_title('GT Mask (Downsampled)')
-    
-    # Resize probability to match downsampled image size if needed
-    H_down_img, W_down_img = image_down.size[1], image_down.size[0]
-    pred_down_prob_square_resized = pred_down_prob_square
-    
-    # Show soft probability as grayscale
-    axes[1, 2].imshow(pred_down_prob_square_resized, cmap='gray', vmin=0, vmax=1)
-    axes[1, 2].set_title(f'Soft Prediction (Downsampled, Epoch {epoch})')
-    
-    # Blend soft prediction with downsampled image
-    overlay_down = np.array(image_down).copy().astype(float)
-    # Blend red channel with probability (red square class)
-    overlay_down[:, :, 0] = overlay_down[:, :, 0] * (1 - 0.6 * pred_down_prob_square_resized) + 255 * 0.6 * pred_down_prob_square_resized
-    axes[1, 3].imshow(overlay_down.astype(np.uint8))
-    axes[1, 3].set_title('Soft Overlay (Downsampled)')  
-    
-    # Row 3: Contours
-    axes[2, 0].imshow(contours_gt_x, cmap='hot')
-    axes[2, 0].set_title('GT Contours X')
-    
-    axes[2, 1].imshow(contours_gt_y, cmap='hot')
-    axes[2, 1].set_title('GT Contours Y')
-    
-    axes[2, 2].imshow(contours_noisy_x, cmap='hot')
-    axes[2, 2].set_title(f'Noisy Contours X ({noise_percentage*100:.1f}%, shift={noise_shift})')
-    
-    axes[2, 3].imshow(contours_noisy_y, cmap='hot')
-    axes[2, 3].set_title(f'Noisy Contours Y ({noise_percentage*100:.1f}%, shift={noise_shift})')
-    
-    # Row 4: Mask comparisons
-    axes[3, 0].imshow(mask_gt, cmap='gray')
-    axes[3, 0].set_title('GT Mask (Downsampled)')
-    
-    # Show soft probability mask (foreground class probability)
-    axes[3, 1].imshow(shifted_mask_soft_prob, cmap='gray', vmin=0, vmax=1)
-    axes[3, 1].set_title(f'Shifted Mask (Soft Prob, fg={soft_prob:.1f})')
-    
-    # Difference between GT and shifted mask (using hard mask)
-    mask_diff = np.abs(mask_gt.astype(float) - shifted_mask.astype(float))
-    axes[3, 2].imshow(mask_diff, cmap='hot')
-    axes[3, 2].set_title('Difference (GT - Shifted)')
-    
-    # Overlay soft probability mask on downsampled image
-    overlay_shifted = np.array(image_down).copy()
-    overlay_shifted[:, :, 0] = overlay_shifted[:, :, 0] * (1 - 0.6 * shifted_mask_soft_prob) + 255 * 0.6 * shifted_mask_soft_prob
-    axes[3, 3].imshow(overlay_shifted.astype(np.uint8))
-    axes[3, 3].set_title('Soft Mask Overlay')
-    
-    plt.suptitle(f'Boundary Misalignment Test - Epoch {epoch} (Noise: {noise_percentage*100:.1f}%, Shift: {noise_shift}px)', 
-                 fontsize=14, fontweight='bold')
+    pred_prob = torch.softmax(pred_down, dim=0).cpu().numpy()[1]
+    to_np = lambda t: t.cpu().numpy() if isinstance(t, torch.Tensor) else t
+    mask_unary_1_np = to_np(mask_unary_1) if hasattr(mask_unary_1, 'cpu') else mask_unary_1
+    mask_unary_2_np = to_np(mask_unary_2) if hasattr(mask_unary_2, 'cpu') else mask_unary_2
+
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    # Full-resolution original image
+    axes[0, 0].imshow(np.array(image_orig))
+    axes[0, 0].set_title('Image (full res)')
+    axes[0, 1].imshow(mask_gt, cmap='gray', interpolation='nearest')
+    axes[0, 1].set_title('GT mask')
+    axes[0, 2].imshow(pred_prob, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+    axes[0, 2].set_title(f'Pred (epoch {epoch})')
+    # Unary 1 (shifted mask) + pred prob overlay
+    axes[1, 0].imshow(mask_unary_1_np, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+    axes[1, 0].imshow(pred_prob, cmap='viridis', alpha=0.6, vmin=0, vmax=1, interpolation='nearest')
+    axes[1, 0].set_title(f'Unary 1 {shift_unary_1} + pred overlay')
+    # Unary 2 (shifted mask) + pred prob overlay
+    axes[1, 1].imshow(mask_unary_2_np, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
+    axes[1, 1].imshow(pred_prob, cmap='viridis', alpha=0.6, vmin=0, vmax=1, interpolation='nearest')
+    axes[1, 1].set_title(f'Unary 2 {shift_unary_2} + pred overlay')
+    # GT + pred overlay
+    axes[1, 2].imshow(mask_gt, cmap='gray', interpolation='nearest')
+    axes[1, 2].imshow(pred_prob, cmap='viridis', alpha=0.6, vmin=0, vmax=1, interpolation='nearest')
+    axes[1, 2].set_title('GT + pred overlay')
+    plt.suptitle(f'Epoch {epoch} | unary1 {shift_unary_1} | unary2 {shift_unary_2}')
     plt.tight_layout()
-    
-    # Save figure
-    output_path = os.path.join(output_dir, f'boundary_test_epoch_{epoch:03d}.png')
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    path = os.path.join(output_dir, f'boundary_test_epoch_{epoch:03d}.png')
+    plt.savefig(path, dpi=100, bbox_inches='tight')
     plt.close()
-    
-    print(f"Saved visualization to {output_path}")
+    print(f"Saved {path}")
 
 
 def main():
-    # Configuration
-    config_path = 'config.yaml'
-    config = yaml.safe_load(open(config_path, 'r'))
-    
-    # ========== HYPERPARAMETERS ==========
-    # Boundary misalignment parameters
-    NOISE_PERCENTAGE = 0.5  # Percentage of boundaries to shift (0.0-1.0), e.g., 0.2 = 20%
-    NOISE_SHIFT = 1  # Number of pixels to shift boundaries (1 or 2)
-    SOFT_PROB = 0.75  # Soft probability for foreground class (background gets 1.0 - SOFT_PROB)
-    
-    # Training parameters
-    NUM_EPOCHS = 1000
-    LEARNING_RATE = 0.0005
-    BATCH_SIZE = 1
-    
-    # Synthetic image parameters
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    SHIFT_UNARY_1 = (5, 5)
+    SHIFT_UNARY_2 = (-5, -5)   # Second unary: different mask shift
+    SOFT_PROB = 0.75
+    NUM_EPOCHS = 1500
+    LEARNING_RATE = 0.001
     IMAGE_SIZE = (512, 512)
     SQUARE_SIZE = 256
     SQUARE_POS = (128, 128)
-    # ======================================
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Create synthetic image
-    print("Creating synthetic square image...")
+    # Model (no config file)
+    backbone_name = 'dinov3_vitl16'
+    num_transformer_blocks = 0
+    num_conv_blocks = 1
+    use_bottleneck = False
+    use_transpose_conv = False
+
     image_orig, mask_orig = create_synthetic_square_image(
-        size=IMAGE_SIZE,
-        square_size=SQUARE_SIZE,
-        square_pos=SQUARE_POS,
-        color1=(255, 0, 0),  # Red square
-        color2=(0, 255, 0)   # Green background
-    )
-    
-    # Downsample by 4x
-    print("Downsampling image and mask...")
+        size=IMAGE_SIZE, square_size=SQUARE_SIZE, square_pos=SQUARE_POS,
+        color1=(255, 0, 0), color2=(0, 255, 0))
     image_down, mask_down = downsample_image_and_mask(image_orig, mask_orig, factor=4)
-    
     H_down, W_down = mask_down.shape
-    print(f"Downsampled size: {H_down}x{W_down}")
-    
-    # Get ground truth contours
-    print("Generating ground truth contours...")
-    contours_gt_x, contours_gt_y = get_ground_truth_contours(mask_down, device)
-    contours_gt_x_np = contours_gt_x.cpu().numpy()
-    contours_gt_y_np = contours_gt_y.cpu().numpy()
-    
-    # Generate jittered contours by modifying the mask
-    print(f"Generating jittered contours ({NOISE_PERCENTAGE*100:.1f}%, shift={NOISE_SHIFT}px)...")
-    np.random.seed(42)  # For reproducibility
-    contours_noisy_x_np, contours_noisy_y_np, jittered_mask = generate_jittered_contours(
-        mask_down,
-        noise_percentage=NOISE_PERCENTAGE, 
-        noise_shift=NOISE_SHIFT,
-        device=device
-    )
-    contours_noisy_x = torch.from_numpy(contours_noisy_x_np).float().to(device)
-    contours_noisy_y = torch.from_numpy(contours_noisy_y_np).float().to(device)
-    
-    # Setup transforms
+
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    # Create dataset - use original image for model input (model expects original resolution)
-    # Model will internally downsample to 4x, so output will be at 128x128
     transformed_image, _ = create_synthetic_dataset(image_orig, mask_orig, transform)
-    transformed_image = transformed_image.unsqueeze(0).to(device)  # Add batch dimension
-    
-    # Target should be at the model output resolution (4x downsampled = 128x128)
-    # So we use mask_down
-    target = torch.from_numpy(mask_down).long().to(device)  # [H_down, W_down]
-    
-    # Initialize model
-    print("Initializing model...")
+    transformed_image = transformed_image.unsqueeze(0).to(device)
+    target = torch.from_numpy(mask_down).long().to(device)
+    output_dir = 'output_boundary_test'
+    os.makedirs(output_dir, exist_ok=True)
+
     model = DinoWSSS(
-        backbone_name=config['model']['backbone_name'],
-        num_transformer_blocks=config['model']['num_transformer_blocks'],
-        num_conv_blocks=config['model']['num_conv_blocks'],
-        out_channels=2,  # 2 classes
-        use_bottleneck=config['model']['use_bottleneck'],
-        use_transpose_conv=config['model']['use_transpose_conv']
+        backbone_name=backbone_name,
+        num_transformer_blocks=num_transformer_blocks,
+        num_conv_blocks=num_conv_blocks,
+        out_channels=2,
+        use_bottleneck=use_bottleneck,
+        use_transpose_conv=use_transpose_conv
     ).to(device)
-    model.backbone.eval()
-    model.dinotxt_head.eval()
-    
-    # Initialize optimizer
+
+    # t-SNE of backbone patch features (once)
+    with torch.no_grad():
+        _, patch_tokens, _ = model.get_backbone_features(transformed_image)
+    X = patch_tokens[0].cpu().numpy()  # (P, D)
+    from sklearn.manifold import TSNE
+    xy = TSNE(n_components=2, random_state=0).fit_transform(X)
+    mask_unary_1_tsne = shift_mask(mask_down, shift_down=SHIFT_UNARY_1[0], shift_right=SHIFT_UNARY_1[1])
+    p = int(np.sqrt(len(X)))
+    mask_patch = F.interpolate(
+        torch.from_numpy(mask_unary_1_tsne).float().unsqueeze(0).unsqueeze(0),
+        size=(p, p), mode='nearest'
+    ).squeeze().numpy().flatten()
+    plt.figure(figsize=(6, 5))
+    plt.scatter(xy[:, 0], xy[:, 1], c=mask_patch, cmap='coolwarm', s=8, alpha=0.8)
+    plt.colorbar(label='Unary 1 (0=bg, 1=fg)')
+    plt.title('Backbone patch features (t-SNE)')
+    plt.savefig(os.path.join(output_dir, 'backbone_tsne.png'), dpi=100, bbox_inches='tight')
+    plt.close()
+    print(f"Saved {output_dir}/backbone_tsne.png")
+
     optimizer_params = [
         {'params': model.transformer_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.ln.parameters(), 'lr': LEARNING_RATE},
         {'params': model.conv_blocks.parameters(), 'lr': LEARNING_RATE},
         {'params': model.lin_classifier.parameters(), 'lr': LEARNING_RATE},
     ]
-    if config['model']['use_transpose_conv']:
+    if use_transpose_conv:
         optimizer_params.append({'params': model.upsample_conv1.parameters(), 'lr': LEARNING_RATE})
         optimizer_params.append({'params': model.upsample_conv2.parameters(), 'lr': LEARNING_RATE})
-    
-    optimizer = torch.optim.SGD(
-        params=optimizer_params,
-        lr=LEARNING_RATE, momentum=0.9, weight_decay=0.0001
-    )
-    
-    # Training loop
-    print(f"\nStarting training for {NUM_EPOCHS} epochs...")
-    output_dir = 'output_boundary_test'
-    os.makedirs(output_dir, exist_ok=True)
-    
+    optimizer = torch.optim.SGD(optimizer_params, lr=LEARNING_RATE, momentum=0.9, weight_decay=0.0001)
+
     losses = []
-    
+    losses_unary_1 = []
+    losses_unary_2 = []
+    miou_epochs = []
+    miou_values = []
+    pred_prob_frames = []  # for video: (epoch, pred_prob array)
+
     for epoch in tqdm(range(NUM_EPOCHS), desc="Training"):
         model.train()
         model.backbone.eval()
         model.dinotxt_head.eval()
-        
         optimizer.zero_grad()
-        
-        # Forward pass
-        model_outputs = model(transformed_image)
-        segmentations = model_outputs['seg']  # [B, C, H, W]
-        
-        # Use shifted original mask for unary potentials (instead of jittered mask)
+
+        segmentations = model(transformed_image)['seg']
         B, C, H_seg, W_seg = segmentations.shape
-        
-        # Shift the original mask up and left by 1 pixel
-        target_tensor = target.unsqueeze(0)  # [1, H_down, W_down] for batch dimension
-        shifted_mask = shift_mask(target_tensor[0], shift_up=5, shift_left=5)  # [H_down, W_down]
-        shifted_mask_resized = shifted_mask
-        
-        # Convert to soft probabilities (shifted mask)
-        # Use soft probabilities: foreground class gets SOFT_PROB, background gets 1.0 - SOFT_PROB
-        # For valid probability distribution: if mask==1 (foreground): [bg=1-SOFT_PROB, fg=SOFT_PROB]
-        #                                     if mask==0 (background): [bg=SOFT_PROB, fg=1-SOFT_PROB]
-        pseudolabel_probs = torch.zeros((B, 2, H_seg, W_seg), dtype=torch.float32, device=device)
-        for b in range(B):
-            # Foreground pixels (shifted_mask == 1): [bg=1-SOFT_PROB, fg=SOFT_PROB]
-            # Background pixels (shifted_mask == 0): [bg=SOFT_PROB, fg=1-SOFT_PROB]
-            is_foreground = (shifted_mask_resized == 1).float()
-            pseudolabel_probs[b, 0] = is_foreground * (1.0 - SOFT_PROB) + (1.0 - is_foreground) * SOFT_PROB  # background class
-            pseudolabel_probs[b, 1] = is_foreground * SOFT_PROB + (1.0 - is_foreground) * (1.0 - SOFT_PROB)  # foreground class
-        
-        # Unary loss
-        unary_loss = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs)
-        
-        if epoch < 200:
-            pairwise_loss = torch.tensor(0.0, device=device)
-        else:
-            pairwise_loss = PottsLoss(
-                'quadratic',
-                segmentations,
-                contours_noisy_x.unsqueeze(0),
-                contours_noisy_y.unsqueeze(0),
-                use_color_diff=False
-            )
-        
-        total_loss = unary_loss + pairwise_loss
-        
+
+        mask_unary_1 = shift_mask(target, shift_down=SHIFT_UNARY_1[0], shift_right=SHIFT_UNARY_1[1])
+        is_fg_1 = (mask_unary_1 == 1).float()
+        pseudolabel_probs_1 = torch.zeros((B, 2, H_seg, W_seg), dtype=torch.float32, device=device)
+        pseudolabel_probs_1[:, 0] = is_fg_1 * (1.0 - SOFT_PROB) + (1.0 - is_fg_1) * SOFT_PROB
+        pseudolabel_probs_1[:, 1] = is_fg_1 * SOFT_PROB + (1.0 - is_fg_1) * (1.0 - SOFT_PROB)
+
+        mask_unary_2 = shift_mask(target, shift_down=SHIFT_UNARY_2[0], shift_right=SHIFT_UNARY_2[1])
+        is_fg_2 = (mask_unary_2 == 1).float()
+        pseudolabel_probs_2 = torch.zeros((B, 2, H_seg, W_seg), dtype=torch.float32, device=device)
+        pseudolabel_probs_2[:, 0] = is_fg_2 * (1.0 - SOFT_PROB) + (1.0 - is_fg_2) * SOFT_PROB
+        pseudolabel_probs_2[:, 1] = is_fg_2 * SOFT_PROB + (1.0 - is_fg_2) * (1.0 - SOFT_PROB)
+
+        unary_loss_1 = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs_1)
+        unary_loss_2 = CollisionCrossEntropyLoss(segmentations, pseudolabel_probs_2)
+        total_loss = unary_loss_1 + unary_loss_2
         total_loss.backward()
         optimizer.step()
-        
         losses.append(total_loss.item())
-        
-        # Visualize every 5 epochs
+        losses_unary_1.append(unary_loss_1.item())
+        losses_unary_2.append(unary_loss_2.item())
+
         if (epoch + 1) % 5 == 0 or epoch == 0:
             model.eval()
             with torch.no_grad():
-                # Get predictions at downsampled resolution (model output is already 4x downsampled)
-                pred_down = model(transformed_image)['seg'][0]  # [C, H_down, W_down]
-                
-                # Get predictions at original resolution by upsampling the model output
-                pred_orig = F.interpolate(
-                    pred_down.unsqueeze(0),
-                    size=(image_orig.size[1], image_orig.size[0]),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(0)  # [C, H_orig, W_orig]
-                
-                # Create soft probability mask for visualization (foreground class probability)
-                # Use shifted mask instead of jittered mask
-                shifted_mask_np = shift_mask(target.cpu().numpy(), shift_up=5, shift_left=5)
-                shifted_mask_soft_prob = shifted_mask_np.astype(float) * SOFT_PROB + (1.0 - shifted_mask_np.astype(float)) * (1.0 - SOFT_PROB)
-                
+                pred_down = model(transformed_image)['seg'][0]
+                pred_prob = torch.softmax(pred_down, dim=0).cpu().numpy()[1]
+                pred_mask = (pred_prob >= 0.5).astype(np.uint8)
+                miou = compute_miou(pred_mask, mask_down, num_classes=2)
+                miou_epochs.append(epoch + 1)
+                miou_values.append(miou)
+                pred_prob_frames.append((epoch + 1, pred_prob))
+                mask_unary_1_np = shift_mask(target.cpu().numpy(), shift_down=SHIFT_UNARY_1[0], shift_right=SHIFT_UNARY_1[1])
+                mask_unary_2_np = shift_mask(target.cpu().numpy(), shift_down=SHIFT_UNARY_2[0], shift_right=SHIFT_UNARY_2[1])
                 visualize_results(
-                    image_orig, image_down, mask_down,
-                    pred_down, pred_orig,
-                    contours_gt_x_np, contours_gt_y_np,
-                    contours_noisy_x_np, contours_noisy_y_np,
-                    shifted_mask_np, shifted_mask_soft_prob,
-                    epoch + 1, output_dir,
-                    NOISE_PERCENTAGE, NOISE_SHIFT, SOFT_PROB
-                )
-        
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Loss: {total_loss.item()} "
-                  f"(Unary: {unary_loss.item()}, Pairwise: {pairwise_loss.item()})")
-    
-    # Plot loss curve
-    plt.figure(figsize=(10, 6))
-    plt.plot(losses)
-    plt.xlabel('Epoch')
-    plt.ylabel('Total Loss')
-    plt.title(f'Training Loss (Noise: {NOISE_PERCENTAGE*100:.1f}%, Shift: {NOISE_SHIFT}px)')
-    plt.grid(True)
-    plt.savefig(os.path.join(output_dir, 'loss_curve.png'), dpi=150, bbox_inches='tight')
+                    image_orig, mask_down, pred_down,
+                    mask_unary_1_np, mask_unary_2_np, epoch + 1, output_dir,
+                    SHIFT_UNARY_1, SHIFT_UNARY_2)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    ax1.plot(losses, label='Total')
+    ax1.plot(losses_unary_1, label='Unary 1')
+    ax1.plot(losses_unary_2, label='Unary 2')
+    ax1.legend()
+    ax1.set_title('Loss')
+    ax2.plot(miou_epochs, miou_values, 'b.-')
+    ax2.set_title('Pred vs GT mIoU')
+    ax2.set_ylim(0, 1)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'loss_curve.png'), dpi=100, bbox_inches='tight')
     plt.close()
-    
-    print(f"\nTraining complete! Results saved to {output_dir}/")
-    print(f"Final loss: {losses[-1]:.4f}")
+    final_miou = miou_values[-1] if miou_values else float('nan')
+    print(f"Done. Results in {output_dir}/, final loss total={losses[-1]:.4f} unary1={losses_unary_1[-1]:.4f} unary2={losses_unary_2[-1]:.4f} mIoU={final_miou:.4f}" if not np.isnan(final_miou) else f"Done. Results in {output_dir}/, final loss total={losses[-1]:.4f} unary1={losses_unary_1[-1]:.4f} unary2={losses_unary_2[-1]:.4f}")
+
+    # Compile pred_prob frames into video (gray heatmap, upscaled for readability)
+    import imageio
+    video_scale = 4  # upscale pred_prob to larger size
+    video_fps = 20
+    grays = np.clip(np.stack([p for _, p in pred_prob_frames]) * 255, 0, 255).astype(np.uint8)
+    frames_rgb = np.stack([np.stack([g, g, g], axis=-1) for g in grays])
+    h, w = frames_rgb[0].shape[:2]
+    h_out, w_out = h * video_scale, w * video_scale
+    frames_upscaled = [np.array(Image.fromarray(f).resize((w_out, h_out), Image.Resampling.LANCZOS)) for f in frames_rgb]
+    out_path = os.path.join(output_dir, 'predictions.mp4')
+    writer = imageio.get_writer(out_path, format='FFMPEG', fps=video_fps, codec='libx264', quality=8)
+    for img in frames_upscaled:
+        writer.append_data(img)
+    writer.close()
+    print(f"Saved video: {out_path} ({len(pred_prob_frames)} pred_prob frames)")
 
 
 if __name__ == "__main__":

@@ -1,36 +1,31 @@
 import torch
 import torch.nn.functional as F
 
-def test_time_augmentation_inference(model, image, target_size, scales=[0.75, 1.0, 1.25], device='cuda'):
+def test_time_augmentation_inference(model, image, target_size, scales=[1.0], base_size=(448, 448), device='cuda'):
     """
     Perform test-time augmentation by running inference at multiple scales with horizontal flips and aggregating outputs.
-    
+    When base_size is set, input is interpolated once to (base_size * scale) per scale; otherwise uses image size * scale.
+
     Args:
         model: The segmentation model
-        image: Input image tensor [C, H, W] (already normalized)
+        image: Input image tensor [C, H, W] (already normalized, original resolution)
         target_size: Target size (H, W) to resize all outputs to
         scales: List of scale factors to apply
+        base_size: (H, W) base size; input is resized to (base_size[0]*s, base_size[1]*s) for each scale s
         device: Device to run inference on
-    
+
     Returns:
         Aggregated segmentation logits [1, num_classes, H, W]
     """
-    original_size = image.shape[-2:]  # (H, W)
-    
+    (bh, bw) = base_size
     all_outputs = []
-    
+
     with torch.no_grad():
         for scale in scales:
-            # Calculate new size
-            new_h = int(original_size[0] * scale)
-            new_w = int(original_size[1] * scale)
-            
-            # Resize image
+            size = (int(bh * scale), int(bw * scale))
             scaled_image = F.interpolate(
-                image.unsqueeze(0),
-                size=(new_h, new_w),
-                mode='bilinear',
-                align_corners=False
+                image.unsqueeze(0), size=size,
+                mode='bilinear', align_corners=False
             )
             
             # Run inference on original orientation
